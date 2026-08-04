@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Music Search</title>
+  <link rel="stylesheet" href="index.css">
+</head>
+<body>
+  <div class="container">
+    <div class="hero">
+      <h1>Find your next favorite track</h1>
+      <p>Search songs from iTunes and preview them instantly.</p>
+    </div>
+    <div class="search-bar">
+      <input id="query" placeholder="Search artist or song" onkeydown="if(event.key==='Enter') search()">
+      <button onclick="search()">Search</button>
+    </div>
+    <div class="results-toolbar">
+      <span class="results-count" id="resultsCount">No results yet</span>
+      <input id="filterInput" placeholder="Filter results" oninput="filterResults()">
+    </div>
+    <div id="nowPlaying" class="now-playing">Pick a song to start listening.</div>
+    <div id="results"></div>
+    <div class="footer-note">Tip: only one preview plays at a time.</div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
