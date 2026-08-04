@@ -2,6 +2,8 @@
 
 A lightweight, fast media search tool built in Go that interfaces with Apple's public iTunes Search API. Built to explore Go's concurrency, strict typing, and zero-dependency compilation.
 
+![App Screenshot](path/to/screenshot.png)
+
 ## Features
 
 - **Instant Search:** Query track, album, and artist metadata directly from the command line / app interface.
@@ -17,11 +19,12 @@ A lightweight, fast media search tool built in Go that interfaces with Apple's p
 - **UI / Library:** [e.g., Standard Library / Bubbletea / Fyne]
 
 ## Architecture & Code Highlights
-├── main.go            # Application entrypoint & CLI loop
-├── api/
-│   └── itunes.go      # HTTP client, endpoint queries, and payload parsing
-├── models/
-│   └── track.go       # Struct definitions matching iTunes JSON schema
+├── Song         
+├── client
+│  
+├── server
+│   └── main.go       # Struct definitions matching iTunes JSON schema
+                      # HTTP client, endpoint queries, and payload parsing
 └── README.md
 
 
@@ -46,8 +49,8 @@ Installation & Run
 Clone the repository:
 
 Bash
-git clone [https://github.com//YOUR_REPO_NAME.git](https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git)
-cd YOUR_REPO_NAME
+git clone [https://github.com/Null-source404/GO--] (https://github.com/Null-source404/GO--.git)
+cd Song
 Run directly:
 
 Bash
