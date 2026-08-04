@@ -2,7 +2,7 @@
 
 A lightweight, fast media search tool built in Go that interfaces with Apple's public iTunes Search API. Built to explore Go's concurrency, strict typing, and zero-dependency compilation.
 
-![App Screenshot](Song/Screenshot 2026-08-04 153925.png)
+![App Screenshot](Song/screenshot-2026-08-04.png)
 
 ## Features
 
