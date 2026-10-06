@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,7 @@ type Track struct {
 	ReleaseDate      string  `json:"releaseDate,omitempty"`
 	TrackPrice       float64 `json:"trackPrice,omitempty"`
 	Currency         string  `json:"currency,omitempty"`
+	RecReason        string  `json:"recReason,omitempty"`
 }
 
 type Album struct {
@@ -63,6 +66,54 @@ type ArtistProfileResponse struct {
 	ArtistName string  `json:"artistName"`
 	TopTracks  []Track `json:"topTracks"`
 	Albums     []Album `json:"albums"`
+}
+
+type RecommendationsResponse struct {
+	WeekLabel     string   `json:"weekLabel"`
+	ActivityBasis []string `json:"activityBasis"`
+	ForYou        []Track  `json:"forYou"`
+	WeeklyHits    []Track  `json:"weeklyHits"`
+}
+
+type iTunesRSSFeed struct {
+	Feed struct {
+		Entry []struct {
+			ID struct {
+				Attributes struct {
+					ImID string `json:"im:id"`
+				} `json:"attributes"`
+			} `json:"id"`
+			Name struct {
+				Label string `json:"label"`
+			} `json:"im:name"`
+			Artist struct {
+				Label string `json:"label"`
+			} `json:"im:artist"`
+			Collection struct {
+				Name struct {
+					Label string `json:"label"`
+				} `json:"im:name"`
+			} `json:"im:collection"`
+			Image []struct {
+				Label string `json:"label"`
+			} `json:"im:image"`
+			Link []struct {
+				Attributes struct {
+					Rel  string `json:"rel"`
+					Type string `json:"type"`
+					Href string `json:"href"`
+				} `json:"attributes"`
+			} `json:"link"`
+			Category struct {
+				Attributes struct {
+					Label string `json:"label"`
+				} `json:"attributes"`
+			} `json:"category"`
+			ReleaseDate struct {
+				Label string `json:"label"`
+			} `json:"im:releaseDate"`
+		} `json:"entry"`
+	} `json:"feed"`
 }
 
 type LrcLibItem struct {
@@ -114,32 +165,34 @@ type FullTrackResponse struct {
 	Authenticated bool   `json:"authenticated"`
 }
 
+type audiusSearchResponse struct {
+	Data []struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+	} `json:"data"`
+}
+
 var (
 	httpClient = &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 12 * time.Second,
 	}
-	authMu       sync.RWMutex
-	usersByEmail = make(map[string]UserRecord)
-	sessions     = make(map[string]string) // token -> email
-	ytVideoRegex = regexp.MustCompile(`"videoId":"([a-zA-Z0-9_-]{11})"`)
-
-	// Full-length (3 to 6+ minute) studio MP3 streams for uninterrupted native Web Audio deck playback
-	fullLengthStudioStreams = []string{
-		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
-		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3",
-		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3",
-		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3",
-		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-6.mp3",
-		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3",
-		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-9.mp3",
-		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-10.mp3",
+	streamClient = &http.Client{
+		Timeout: 0, // Streaming audio response body
 	}
+	authMu        sync.RWMutex
+	usersByEmail  = make(map[string]UserRecord)
+	sessions      = make(map[string]string) // token -> email
+	streamCacheMu sync.RWMutex
+	streamCache   = make(map[string]string)
+	ytCacheMu     sync.RWMutex
+	ytCache       = make(map[string]string)
+	ytVideoRegex  = regexp.MustCompile(`"videoId":"([a-zA-Z0-9_-]{11})"`)
 )
 
 func setCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Range")
 }
 
 func usersFilePath() string {
@@ -336,7 +389,25 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(PublicUser{Name: user.Name, Email: user.Email})
 }
 
+func isYouTubeEmbeddable(videoID string) bool {
+	oembedURL := fmt.Sprintf("https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=%s&format=json", url.QueryEscape(videoID))
+	resp, err := httpClient.Get(oembedURL)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
 func lookupYouTubeVideoID(trackName, artistName string) string {
+	cacheKey := strings.ToLower(strings.TrimSpace(trackName) + "::" + strings.TrimSpace(artistName))
+	ytCacheMu.RLock()
+	if cached, ok := ytCache[cacheKey]; ok && cached != "" {
+		ytCacheMu.RUnlock()
+		return cached
+	}
+	ytCacheMu.RUnlock()
+
 	query := fmt.Sprintf("%s %s official audio", trackName, artistName)
 	searchURL := fmt.Sprintf("https://www.youtube.com/results?search_query=%s", url.QueryEscape(query))
 
@@ -358,20 +429,158 @@ func lookupYouTubeVideoID(trackName, artistName string) string {
 		return ""
 	}
 
-	matches := ytVideoRegex.FindStringSubmatch(string(body))
-	if len(matches) > 1 {
-		return matches[1]
+	allMatches := ytVideoRegex.FindAllStringSubmatch(string(body), 12)
+	seen := make(map[string]bool)
+	candidates := make([]string, 0, 5)
+	for _, m := range allMatches {
+		if len(m) > 1 && !seen[m[1]] {
+			seen[m[1]] = true
+			candidates = append(candidates, m[1])
+			if len(candidates) >= 5 {
+				break
+			}
+		}
 	}
+
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	// Verify embeddability of all candidates concurrently using goroutines
+	valid := make([]bool, len(candidates))
+	var wg sync.WaitGroup
+	for i, id := range candidates {
+		wg.Add(1)
+		go func(idx int, vid string) {
+			defer wg.Done()
+			valid[idx] = isYouTubeEmbeddable(vid)
+		}(i, id)
+	}
+	wg.Wait()
+
+	chosen := candidates[0]
+	for i, ok := range valid {
+		if ok {
+			chosen = candidates[i]
+			break
+		}
+	}
+
+	ytCacheMu.Lock()
+	ytCache[cacheKey] = chosen
+	ytCacheMu.Unlock()
+	return chosen
+}
+
+// Concurrently resolves a direct full-length MP3 stream with a strict 1.2s timeout so playback starts fast
+func resolveDirectFullSongURL(trackName, artistName string) string {
+	cacheKey := strings.ToLower(strings.TrimSpace(trackName) + "::" + strings.TrimSpace(artistName))
+	streamCacheMu.RLock()
+	if cached, ok := streamCache[cacheKey]; ok && cached != "" {
+		streamCacheMu.RUnlock()
+		return cached
+	}
+	streamCacheMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+
+	query := strings.TrimSpace(trackName + " " + artistName)
+	audiusURL := fmt.Sprintf("https://api.audius.co/v1/tracks/search?query=%s&app_name=soniccrate", url.QueryEscape(query))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, audiusURL, nil)
+	if err == nil {
+		if resp, err := httpClient.Do(req); err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			var audiusData audiusSearchResponse
+			if err := json.Unmarshal(body, &audiusData); err == nil && len(audiusData.Data) > 0 {
+				firstID := audiusData.Data[0].ID
+				if firstID != "" {
+					streamEndpoint := fmt.Sprintf("https://api.audius.co/v1/tracks/%s/stream?app_name=soniccrate", url.PathEscape(firstID))
+					streamCacheMu.Lock()
+					streamCache[cacheKey] = streamEndpoint
+					streamCacheMu.Unlock()
+					return streamEndpoint
+				}
+			}
+		}
+	}
+
 	return ""
 }
 
-func selectFullLengthStream(trackName, artistName string) string {
-	h := sha256.Sum256([]byte(strings.ToLower(trackName + "::" + artistName)))
-	idx := int(h[0]) % len(fullLengthStudioStreams)
-	return fullLengthStudioStreams[idx]
+// Same-origin audio stream proxy (/stream): eliminates CORS & mixed-content blocks and streams the full song
+func streamHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	track := strings.TrimSpace(r.URL.Query().Get("track"))
+	artist := strings.TrimSpace(r.URL.Query().Get("artist"))
+	previewURL := strings.TrimSpace(r.URL.Query().Get("preview"))
+
+	_, isMember := authenticateRequest(r)
+	targetURL := ""
+
+	if isMember && track != "" {
+		targetURL = resolveDirectFullSongURL(track, artist)
+	}
+	if targetURL == "" {
+		targetURL = previewURL
+	}
+	if targetURL == "" {
+		http.Error(w, "no audio stream available", http.StatusNotFound)
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		http.Error(w, "invalid upstream audio URL", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	if rng := r.Header.Get("Range"); rng != "" {
+		req.Header.Set("Range", rng)
+	}
+
+	resp, err := streamClient.Do(req)
+	if err != nil || (resp.StatusCode >= 400 && previewURL != "" && targetURL != previewURL) {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if previewURL != "" && targetURL != previewURL {
+			fallbackReq, _ := http.NewRequest(http.MethodGet, previewURL, nil)
+			if rng := r.Header.Get("Range"); rng != "" {
+				fallbackReq.Header.Set("Range", rng)
+			}
+			resp, err = streamClient.Do(fallbackReq)
+		}
+		if err != nil || resp == nil {
+			http.Error(w, "failed to connect to audio stream", http.StatusBadGateway)
+			return
+		}
+	}
+	defer resp.Body.Close()
+
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	} else {
+		w.Header().Set("Content-Type", "audio/mpeg")
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
-// Protected endpoint: returns full-length audio stream + official YouTube match only for registered/logged-in users
+// Protected metadata endpoint: returns full-length stream URL + verified embeddable YouTube ID
 func fullTrackHandler(w http.ResponseWriter, r *http.Request) {
 	setCORSHeaders(w)
 	if r.Method == http.MethodOptions {
@@ -387,27 +596,22 @@ func fullTrackHandler(w http.ResponseWriter, r *http.Request) {
 
 	track := strings.TrimSpace(r.URL.Query().Get("track"))
 	artist := strings.TrimSpace(r.URL.Query().Get("artist"))
+	preview := strings.TrimSpace(r.URL.Query().Get("preview"))
+	token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+
 	if track == "" {
 		http.Error(w, "missing 'track' query param", http.StatusBadRequest)
 		return
 	}
 
-	var (
-		youtubeID    string
-		fullAudioURL string
-		wg           sync.WaitGroup
+	youtubeID := lookupYouTubeVideoID(track, artist)
+	fullAudioURL := fmt.Sprintf(
+		"/stream?track=%s&artist=%s&preview=%s&token=%s",
+		url.QueryEscape(track),
+		url.QueryEscape(artist),
+		url.QueryEscape(preview),
+		url.QueryEscape(token),
 	)
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		youtubeID = lookupYouTubeVideoID(track, artist)
-	}()
-	go func() {
-		defer wg.Done()
-		fullAudioURL = selectFullLengthStream(track, artist)
-	}()
-	wg.Wait()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(FullTrackResponse{
@@ -451,7 +655,6 @@ func fetchTracks(query string, limit int) ([]Track, error) {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Normalize metadata and upgrade artwork resolution concurrently using goroutines
 	var wg sync.WaitGroup
 	results := make([]Track, len(data.Results))
 	for i, track := range data.Results {
@@ -470,6 +673,203 @@ func fetchTracks(query string, limit int) ([]Track, error) {
 	wg.Wait()
 
 	return results, nil
+}
+
+// Fetch Weekly Global Hits from Apple's iTunes Top Songs RSS feed (with search fallback)
+func fetchWeeklyHits(limit int) []Track {
+	if limit <= 0 {
+		limit = 12
+	}
+	rssURL := fmt.Sprintf("https://itunes.apple.com/us/rss/topsongs/limit=%d/json", limit)
+	resp, err := httpClient.Get(rssURL)
+	if err == nil {
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err == nil {
+			var rss iTunesRSSFeed
+			if err := json.Unmarshal(body, &rss); err == nil && len(rss.Feed.Entry) > 0 {
+				hits := make([]Track, 0, len(rss.Feed.Entry))
+				for idx, entry := range rss.Feed.Entry {
+					trackID, _ := strconv.ParseInt(entry.ID.Attributes.ImID, 10, 64)
+					art100 := ""
+					if len(entry.Image) > 0 {
+						art100 = entry.Image[len(entry.Image)-1].Label
+					}
+					art600 := art100
+					if art100 != "" {
+						art600 = strings.Replace(art100, "170x170bb", "600x600bb", 1)
+					}
+					previewURL := ""
+					viewURL := ""
+					for _, l := range entry.Link {
+						if strings.Contains(l.Attributes.Type, "audio") || l.Attributes.Rel == "enclosure" {
+							previewURL = l.Attributes.Href
+						} else if l.Attributes.Rel == "alternate" && viewURL == "" {
+							viewURL = l.Attributes.Href
+						}
+					}
+					if previewURL != "" && entry.Name.Label != "" {
+						hits = append(hits, Track{
+							TrackID:          trackID,
+							TrackName:        strings.TrimSpace(entry.Name.Label),
+							ArtistName:       strings.TrimSpace(entry.Artist.Label),
+							CollectionName:   strings.TrimSpace(entry.Collection.Name.Label),
+							PreviewURL:       previewURL,
+							ArtworkURL100:    art100,
+							ArtworkURL600:    art600,
+							TrackViewURL:     viewURL,
+							PrimaryGenreName: entry.Category.Attributes.Label,
+							ReleaseDate:      entry.ReleaseDate.Label,
+							TrackTimeMillis:  210000,
+							RecReason:        fmt.Sprintf("Weekly Global Chart #%d", idx+1),
+						})
+					}
+				}
+				if len(hits) > 0 {
+					return hits
+				}
+			}
+		}
+	}
+
+	// Fallback to iTunes Search if RSS feed is unreachable
+	fallback, err := fetchTracks("top hits 2025", limit)
+	if err == nil {
+		for i := range fallback {
+			fallback[i].RecReason = fmt.Sprintf("Weekly Hit #%d", i+1)
+		}
+		return fallback
+	}
+	return []Track{}
+}
+
+// Weekly Recommendations Endpoint (/recommendations):
+// Concurrently combines personalized picks from user activity (artists, genres, searches) with Weekly Global Hits
+func recommendationsHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	rawArtists := strings.TrimSpace(r.URL.Query().Get("artists"))
+	rawGenres := strings.TrimSpace(r.URL.Query().Get("genres"))
+	rawExclude := strings.TrimSpace(r.URL.Query().Get("exclude"))
+
+	excludeIDs := make(map[string]bool)
+	if rawExclude != "" {
+		for _, id := range strings.Split(rawExclude, ",") {
+			trimmed := strings.TrimSpace(id)
+			if trimmed != "" {
+				excludeIDs[trimmed] = true
+			}
+		}
+	}
+
+	type seedQuery struct {
+		term   string
+		reason string
+	}
+
+	var seeds []seedQuery
+	var basis []string
+
+	if rawArtists != "" {
+		for _, a := range strings.Split(rawArtists, ",") {
+			artist := strings.TrimSpace(a)
+			if artist != "" && len(seeds) < 3 {
+				seeds = append(seeds, seedQuery{
+					term:   artist,
+					reason: fmt.Sprintf("Based on your activity with %s", artist),
+				})
+				basis = append(basis, artist)
+			}
+		}
+	}
+
+	if rawGenres != "" {
+		for _, g := range strings.Split(rawGenres, ",") {
+			genre := strings.TrimSpace(g)
+			if genre != "" && len(seeds) < 4 {
+				seeds = append(seeds, seedQuery{
+					term:   genre + " hits",
+					reason: fmt.Sprintf("Matched to your %s listening sessions", genre),
+				})
+				basis = append(basis, genre)
+			}
+		}
+	}
+
+	if len(seeds) == 0 {
+		seeds = []seedQuery{
+			{term: "Daft Punk", reason: "Studio Discovery · Electronic Essentials"},
+			{term: "The Weeknd", reason: "Studio Discovery · Synthwave & Pop"},
+			{term: "Tame Impala", reason: "Studio Discovery · Modern Psychedelia"},
+		}
+		basis = []string{"Electronic Essentials", "Synthwave & Pop", "Modern Psychedelia"}
+	}
+
+	var (
+		wg         sync.WaitGroup
+		mu         sync.Mutex
+		forYouPool = make([][]Track, len(seeds))
+		weeklyHits []Track
+	)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		weeklyHits = fetchWeeklyHits(12)
+	}()
+
+	for i, s := range seeds {
+		wg.Add(1)
+		go func(idx int, sq seedQuery) {
+			defer wg.Done()
+			tracks, err := fetchTracks(sq.term, 8)
+			if err != nil {
+				return
+			}
+			for j := range tracks {
+				tracks[j].RecReason = sq.reason
+			}
+			mu.Lock()
+			forYouPool[idx] = tracks
+			mu.Unlock()
+		}(i, s)
+	}
+
+	wg.Wait()
+
+	seen := make(map[int64]bool)
+	forYou := make([]Track, 0, 12)
+	// Interleave tracks across activity seeds so recommendations are diverse
+	for round := 0; round < 8 && len(forYou) < 12; round++ {
+		for sIdx := range forYouPool {
+			if round < len(forYouPool[sIdx]) {
+				t := forYouPool[sIdx][round]
+				idStr := strconv.FormatInt(t.TrackID, 10)
+				if t.TrackID != 0 && !seen[t.TrackID] && !excludeIDs[idStr] && t.PreviewURL != "" {
+					seen[t.TrackID] = true
+					forYou = append(forYou, t)
+					if len(forYou) >= 12 {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	_, isoWeek := time.Now().ISOWeek()
+	weekLabel := fmt.Sprintf("Week %d · %s", isoWeek, time.Now().Format("Jan 2, 2006"))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(RecommendationsResponse{
+		WeekLabel:     weekLabel,
+		ActivityBasis: basis,
+		ForYou:        forYou,
+		WeeklyHits:    weeklyHits,
+	})
 }
 
 func searchHandler(w http.ResponseWriter, r *http.Request) {
@@ -695,6 +1095,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search", searchHandler)
+	mux.HandleFunc("/recommendations", recommendationsHandler)
 	mux.HandleFunc("/artist", artistHandler)
 	mux.HandleFunc("/lyrics", lyricsHandler)
 	mux.HandleFunc("/auth/register", registerHandler)
@@ -702,6 +1103,7 @@ func main() {
 	mux.HandleFunc("/auth/logout", logoutHandler)
 	mux.HandleFunc("/auth/me", meHandler)
 	mux.HandleFunc("/fulltrack", fullTrackHandler)
+	mux.HandleFunc("/stream", streamHandler)
 	mux.Handle("/", http.FileServer(http.Dir(clientDir)))
 
 	log.Printf("Serving client from: %s", clientDir)

@@ -4,9 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>iTunes Music Search</title>
-  <meta name="description" content="Search songs from iTunes, preview 30-second clips as a guest, or register an account to unlock full-length songs, synced lyrics, and artist discographies.">
+  <meta name="description" content="Search songs from iTunes, get weekly recommendations based on your listening activity and global hits, preview 30-second clips as a guest, or register to unlock full-length songs and synced lyrics.">
   <meta property="og:title" content="iTunes Music Search">
-  <meta property="og:description" content="Search songs from iTunes, preview 30-second clips as a guest, or register an account to unlock full-length songs, synced lyrics, and artist discographies.">
+  <meta property="og:description" content="Search songs from iTunes, get weekly recommendations based on your listening activity and global hits, preview 30-second clips as a guest, or register to unlock full-length songs and synced lyrics.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Syne:wght@600;700&display=swap" rel="stylesheet">
@@ -17,9 +17,10 @@
     <a href="#discover" class="brand-mark" onclick="switchTab('discover'); return false;">SonicCrate</a>
     <nav class="top-nav" aria-label="Primary navigation">
       <a href="#discover" id="nav-discover" class="nav-link active" onclick="switchTab('discover'); return false;">Discover</a>
+      <a href="#weekly" id="nav-weekly" class="nav-link" onclick="switchTab('weekly'); return false;">Weekly Picks</a>
+      <a href="#lyrics" id="nav-lyrics" class="nav-link" onclick="switchTab('lyrics'); return false;">Lyrics Studio</a>
       <a href="#quiz" id="nav-quiz" class="nav-link" onclick="switchTab('quiz'); return false;">Blind Quiz</a>
       <a href="#crate" id="nav-crate" class="nav-link" onclick="switchTab('crate'); return false;">Saved Crate (<span id="crateNavCount" class="mono-num">0</span>)</a>
-      <a href="#lyrics-panel" class="nav-link" onclick="focusLyricsStudio(); return false;">Lyrics Studio</a>
     </nav>
     <div class="top-actions">
       <button type="button" class="btn-secondary" onclick="exportCrateM3U()">Export M3U</button>
@@ -29,31 +30,41 @@
 
   <main class="workspace">
     <section class="main-column">
-      <div class="hero">
-        <div class="hero-top-row">
-          <h1>Discover tracks, lyrics, and artist discographies</h1>
+      <!-- Compact Studio Command Bar (eliminates vertical header bloat) -->
+      <div class="command-header">
+        <div class="command-title-row">
+          <h1>Catalog Search, Weekly Radar &amp; Synced Lyrics</h1>
           <span id="accessTierStatus" class="tier-text">Guest Mode · 30s Previews (<a href="#auth" onclick="openAuthModal('register'); return false;">Register for Full Songs</a>)</span>
         </div>
-        <p>Powered by Go concurrency and the iTunes Search API — listen to 30-second previews as a guest, or create a free account to unlock full-length song streaming, synced lyrics, and artist deep-dives.</p>
+
+        <div class="search-command-stack">
+          <div class="search-bar">
+            <input id="query" type="search" placeholder="Search artist, song, genre, or album (e.g. Daft Punk, Kendrick Lamar, Radiohead)..." onkeydown="if(event.key==='Enter') search()">
+            <button type="button" class="btn-primary search-submit-btn" onclick="search()">Search Catalog</button>
+          </div>
+
+          <div class="quick-curations" role="group" aria-label="Search categories and artist curations">
+            <span class="curation-label">Search Categories:</span>
+            <button type="button" class="curation-btn" onclick="quickSearch('Daft Punk')">Daft Punk</button>
+            <button type="button" class="curation-btn" onclick="quickSearch('The Weeknd')">The Weeknd</button>
+            <button type="button" class="curation-btn" onclick="quickSearch('Tame Impala')">Tame Impala</button>
+            <button type="button" class="curation-btn" onclick="quickSearch('Fleetwood Mac')">Fleetwood Mac</button>
+            <button type="button" class="curation-btn" onclick="quickSearch('Nujabes')">Lo-Fi &amp; Jazz</button>
+            <button type="button" class="curation-btn" onclick="quickSearch('Kendrick Lamar')">Hip-Hop</button>
+            <button type="button" class="curation-btn curation-accent" onclick="switchTab('weekly')">Weekly Picks →</button>
+          </div>
+        </div>
       </div>
 
-      <div class="search-bar">
-        <input id="query" type="search" placeholder="Search artist, song, or album (e.g. Daft Punk, Kendrick Lamar, Radiohead)..." onkeydown="if(event.key==='Enter') search()">
-        <button type="button" class="btn-primary" onclick="search()">Search Catalog</button>
-      </div>
-
-      <div class="quick-curations" aria-label="Quick artist curations">
-        <span class="curation-label">Quick explore:</span>
-        <button type="button" class="curation-btn" onclick="quickSearch('Daft Punk')">Daft Punk</button>
-        <button type="button" class="curation-btn" onclick="quickSearch('The Weeknd')">The Weeknd</button>
-        <button type="button" class="curation-btn" onclick="quickSearch('Tame Impala')">Tame Impala</button>
-        <button type="button" class="curation-btn" onclick="quickSearch('Fleetwood Mac')">Fleetwood Mac</button>
-        <button type="button" class="curation-btn" onclick="quickSearch('Nujabes')">Nujabes</button>
-      </div>
-
+      <!-- VIEW 1: DISCOVER CATALOG (with compact 2-col grid, compact rows toggle & side-by-side Split Lyrics drawer) -->
       <div id="view-discover" class="view-section">
         <div class="results-toolbar">
-          <span class="results-count mono-num" id="resultsCount">No results yet</span>
+          <div class="toolbar-left">
+            <span class="results-count mono-num" id="resultsCount">No results yet</span>
+            <span class="toolbar-sep" aria-hidden="true">·</span>
+            <button type="button" id="splitLyricsToggleBtn" class="btn-ghost btn-sm" onclick="toggleSplitLyricsPane()">Split Lyrics Reader: Off</button>
+          </div>
+
           <div class="toolbar-controls">
             <input id="filterInput" type="search" placeholder="Filter loaded tracks..." oninput="filterResults()">
             <select id="sortSelect" aria-label="Sort results" onchange="filterResults()">
@@ -62,18 +73,108 @@
               <option value="year-asc">Sort: Oldest First</option>
               <option value="duration-desc">Sort: Longest Track</option>
             </select>
+            <div class="density-switcher" role="group" aria-label="Result layout density">
+              <button type="button" id="densityGridBtn" class="seg-btn active" onclick="setTrackDensity('grid')" title="2-Column Studio Grid">2-Col Grid</button>
+              <button type="button" id="densityCompactBtn" class="seg-btn" onclick="setTrackDensity('compact')" title="Ultra-Compact Single-Line Rows">Compact Rows</button>
+            </div>
             <label class="toggle-label">
               <input type="checkbox" id="autoPlayToggle" checked>
-              <span>Continuous Queue</span>
+              <span>Auto-Queue</span>
             </label>
           </div>
         </div>
 
         <div id="artistSpotlight" class="artist-spotlight hidden" aria-live="polite"></div>
 
-        <div id="results" class="track-list"></div>
+        <!-- Discover Workspace: supports side-by-side Results + Split Lyrics Reader with independent scrolling -->
+        <div id="discoverSplitLayout" class="discover-split-layout">
+          <div class="catalog-scroll-pane">
+            <div id="results" class="track-list grid-density"></div>
+          </div>
+
+          <aside id="inlineLyricsDrawer" class="inline-lyrics-drawer hidden" aria-label="Side-by-side lyrics reader">
+            <div class="inline-lyrics-top">
+              <div class="inline-lyrics-title-wrap">
+                <h3>Side-by-Side Lyrics</h3>
+                <p id="inlineLyricsSub" class="recent-sub">Select a song to read lyrics alongside search results</p>
+              </div>
+              <div class="inline-lyrics-actions">
+                <button type="button" class="btn-ghost btn-sm" onclick="switchTab('lyrics')" title="Expand to 2-Column Lyrics Studio">Expand ⤢</button>
+                <button type="button" class="btn-ghost btn-sm" onclick="toggleSplitLyricsPane(false)" title="Close side-by-side lyrics">✕</button>
+              </div>
+            </div>
+            <div id="inlineLyricsBody" class="inline-lyrics-body">
+              <div class="lyrics-empty">Click "Lyrics" or play any track to read synced lyrics right next to your search results without losing your place.</div>
+            </div>
+          </aside>
+        </div>
       </div>
 
+      <!-- VIEW 2: WEEKLY RECOMMENDATIONS (Activity-Based "For You" + Weekly Global Hits) -->
+      <div id="view-weekly" class="view-section hidden">
+        <div class="weekly-header-bar">
+          <div class="weekly-title-group">
+            <div class="weekly-kicker-row">
+              <h2>Weekly Recommendations</h2>
+              <span id="weeklyDateLabel" class="mono-num tier-text">Current Week</span>
+            </div>
+            <p id="weeklyBasisSummary" class="quiz-subtitle">Personalized picks tuned to your searches, recently played tracks, and saved crate — paired with this week's top global hits.</p>
+          </div>
+
+          <div class="weekly-controls">
+            <div class="segmented-group weekly-filter-tabs" role="group" aria-label="Filter weekly recommendations">
+              <button type="button" id="wkTabAll" class="seg-btn active" onclick="setWeeklyFilter('all')">All Weekly Picks</button>
+              <button type="button" id="wkTabActivity" class="seg-btn" onclick="setWeeklyFilter('activity')">Based on Your Activity (<span id="wkActivityCount" class="mono-num">0</span>)</button>
+              <button type="button" id="wkTabHits" class="seg-btn" onclick="setWeeklyFilter('hits')">Weekly Global Hits (<span id="wkHitsCount" class="mono-num">0</span>)</button>
+            </div>
+            <button type="button" class="btn-secondary btn-sm" onclick="loadWeeklyRecommendations(true)">↻ Refresh Radar</button>
+          </div>
+        </div>
+
+        <div class="catalog-scroll-pane weekly-scroll-pane">
+          <div id="weeklyActivitySection" class="weekly-section">
+            <div class="weekly-section-head">
+              <h3>Recommended For You · Activity Match</h3>
+              <span id="weeklyActivitySignals" class="meta mono-num">Listening &amp; search signals</span>
+            </div>
+            <div id="weeklyForYouResults" class="track-list grid-density"></div>
+          </div>
+
+          <div id="weeklyHitsSection" class="weekly-section">
+            <div class="weekly-section-head">
+              <h3>Weekly Global Hits · Top Charting Songs</h3>
+              <span class="meta mono-num">Apple Music / iTunes Top Chart</span>
+            </div>
+            <div id="weeklyHitsResults" class="track-list grid-density"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 3: LYRICS STUDIO (2-Column Sheet-Music Layout + Live Line Filter + Click-to-Seek) -->
+      <div id="view-lyrics" class="view-section hidden">
+        <div class="lyrics-main-view">
+          <div class="lyrics-main-header">
+            <div class="lyrics-title-col">
+              <h2>Lyrics Studio</h2>
+              <p id="mainLyricsTrackLabel" class="quiz-subtitle">Select or play any song to read full and time-synced lyrics in a multi-column studio sheet.</p>
+            </div>
+            <div class="lyrics-toolbar-controls">
+              <input id="lyricsSearchInput" type="search" placeholder="Filter verse or lyric line..." oninput="filterDisplayedLyrics()">
+              <div class="density-switcher" role="group" aria-label="Lyrics column layout">
+                <button type="button" id="lyricsCol2Btn" class="seg-btn active" onclick="setLyricsColumnMode('two-col')">2-Col Sheet (Less Scroll)</button>
+                <button type="button" id="lyricsCol1Btn" class="seg-btn" onclick="setLyricsColumnMode('one-col')">1-Col Synced</button>
+              </div>
+              <button type="button" id="mainCopyLyricsBtn" class="btn-secondary btn-sm hidden" onclick="copyCurrentLyrics()">Copy Lyrics</button>
+              <button type="button" class="btn-ghost btn-sm" onclick="switchTab('discover')">← Catalog</button>
+            </div>
+          </div>
+          <div id="mainLyricsContent" class="lyrics-main-body two-col-sheet">
+            <div class="lyrics-empty">Full and time-synced lyrics fetched via the Go backend (`/lyrics`) appear here automatically in a 2-column sheet layout when you play a song or click "Lyrics" on any track card.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 4: BLIND AUDIO QUIZ -->
       <div id="view-quiz" class="view-section hidden">
         <div class="quiz-panel">
           <div class="quiz-header">
@@ -97,22 +198,38 @@
         </div>
       </div>
 
+      <!-- VIEW 5: SAVED CRATE -->
       <div id="view-crate" class="view-section hidden">
         <div class="crate-header">
           <div>
             <h2>Your Saved Crate</h2>
-            <p class="crate-subtitle">Bookmark favorite tracks across searches, play them as a continuous mix, or export as an M3U playlist file.</p>
+            <p class="crate-subtitle">Bookmark favorite tracks across searches and weekly picks, play them as a continuous mix, or export as an M3U playlist file.</p>
           </div>
           <div class="crate-actions">
             <button type="button" class="btn-secondary" onclick="playAllCrate()">Play Entire Crate</button>
             <button type="button" class="btn-ghost" onclick="clearCrate()">Clear Crate</button>
           </div>
         </div>
-        <div id="crateResults" class="track-list"></div>
+        <div class="catalog-scroll-pane">
+          <div id="crateResults" class="track-list grid-density"></div>
+        </div>
       </div>
     </section>
 
     <aside class="studio-sidebar">
+      <div id="recently-played-panel" class="recent-panel">
+        <div class="recent-header">
+          <div>
+            <h3>Recently Played</h3>
+            <p class="recent-sub">Last <span id="recentCountLabel" class="mono-num">0/10</span> songs this session</p>
+          </div>
+          <button type="button" id="clearRecentBtn" class="btn-ghost btn-sm hidden" onclick="clearRecentlyPlayed()">Clear</button>
+        </div>
+        <div id="recentlyPlayedList" class="recent-list">
+          <div class="recent-empty">Songs you listen to during this session appear right here at the top (up to 10 tracks).</div>
+        </div>
+      </div>
+
       <div class="deck-panel">
         <div class="deck-header">
           <span id="deckModeLabel" class="deck-kicker">Listening Deck · 30s Preview Mode</span>
@@ -134,12 +251,14 @@
 
         <div id="fullSongSourceToggle" class="source-switcher hidden">
           <button type="button" id="srcBtnStudio" class="seg-btn active" onclick="switchFullTrackSource('studio')">Full Studio Audio Stream</button>
-          <button type="button" id="srcBtnYoutube" class="seg-btn" onclick="switchFullTrackSource('youtube')">Official Full Song Embed</button>
+          <button type="button" id="srcBtnYoutube" class="seg-btn" onclick="switchFullTrackSource('youtube')">Official Full Song Video</button>
         </div>
 
-        <div id="youtubeEmbedWrap" class="youtube-embed-wrap hidden"></div>
+        <div id="youtubeEmbedWrap" class="youtube-embed-wrap studio-audio-hidden">
+          <div id="ytPlayerMount"></div>
+        </div>
 
-        <canvas id="visualizerCanvas" class="visualizer-canvas" width="340" height="64" aria-label="Audio frequency spectrum visualizer"></canvas>
+        <canvas id="visualizerCanvas" class="visualizer-canvas" width="340" height="52" aria-label="Audio frequency spectrum visualizer"></canvas>
 
         <div class="scrubber-row">
           <span id="currentTimeLabel" class="mono-num time-label">0:00</span>
@@ -165,19 +284,6 @@
             <button type="button" class="seg-btn active" data-rate="1" onclick="setPlaybackSpeed(1)">1.0x Studio</button>
             <button type="button" class="seg-btn" data-rate="1.18" onclick="setPlaybackSpeed(1.18)">1.18x Nightcore</button>
           </div>
-        </div>
-      </div>
-
-      <div id="lyrics-panel" class="lyrics-panel">
-        <div class="lyrics-header">
-          <div>
-            <h3>Lyrics Studio</h3>
-            <p id="lyricsTrackLabel" class="lyrics-sub">Select a song to load full lyrics</p>
-          </div>
-          <button type="button" id="copyLyricsBtn" class="btn-ghost btn-sm hidden" onclick="copyCurrentLyrics()">Copy</button>
-        </div>
-        <div id="lyricsContent" class="lyrics-content">
-          <div class="lyrics-empty">Full and time-synced lyrics fetched via the Go backend (`/lyrics`) appear here automatically when you play or inspect a track.</div>
         </div>
       </div>
     </aside>
@@ -221,9 +327,10 @@
   </div>
 
   <footer class="footer-note">
-    <span>Built with Go (`net/http`, `sync.WaitGroup` concurrency) &amp; Apple iTunes Search API · Guest 30s Previews &amp; Member Full-Track Streaming.</span>
+    <span>Built with Go (`net/http`, `sync.WaitGroup` concurrency) &amp; Apple iTunes Search API · Weekly Activity Recommendations, Guest 30s Previews &amp; Member Full-Track Streaming.</span>
   </footer>
 
+  <script src="https://www.youtube.com/iframe_api" async></script>
   <script src="script.js"></script>
 </body>
 </html>
