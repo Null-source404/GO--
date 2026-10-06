@@ -1,0 +1,6 @@
+node_modules/
+Song/server/itunes-search
+Song/itunes-search
+itunes-search
+*.exe
+.DS_Store

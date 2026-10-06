@@ -4,29 +4,172 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>iTunes Music Search</title>
-  <meta name="description" content="Search songs from iTunes and preview audio tracks instantly.">
+  <meta name="description" content="Search songs from iTunes, explore artist discographies, read synced lyrics, play the blind audio quiz, and build your crate.">
   <meta property="og:title" content="iTunes Music Search">
-  <meta property="og:description" content="Search songs from iTunes and preview audio tracks instantly.">
+  <meta property="og:description" content="Search songs from iTunes, explore artist discographies, read synced lyrics, play the blind audio quiz, and build your crate.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Syne:wght@600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="index.css">
 </head>
 <body>
-  <div class="container">
-    <div class="hero">
-      <h1>Find your next favorite track</h1>
-      <p>Search songs from iTunes and preview them instantly.</p>
+  <header class="top-bar">
+    <a href="#discover" class="brand-mark" onclick="switchTab('discover'); return false;">SonicCrate</a>
+    <nav class="top-nav" aria-label="Primary navigation">
+      <a href="#discover" id="nav-discover" class="nav-link active" onclick="switchTab('discover'); return false;">Discover</a>
+      <a href="#quiz" id="nav-quiz" class="nav-link" onclick="switchTab('quiz'); return false;">Blind Quiz</a>
+      <a href="#crate" id="nav-crate" class="nav-link" onclick="switchTab('crate'); return false;">Saved Crate (<span id="crateNavCount" class="mono-num">0</span>)</a>
+      <a href="#lyrics-panel" class="nav-link" onclick="focusLyricsStudio(); return false;">Lyrics Studio</a>
+    </nav>
+    <div class="top-actions">
+      <button type="button" class="btn-secondary" onclick="exportCrateM3U()">Export M3U Playlist</button>
     </div>
-    <div class="search-bar">
-      <input id="query" placeholder="Search artist or song" onkeydown="if(event.key==='Enter') search()">
-      <button onclick="search()">Search</button>
-    </div>
-    <div class="results-toolbar">
-      <span class="results-count" id="resultsCount">No results yet</span>
-      <input id="filterInput" placeholder="Filter results" oninput="filterResults()">
-    </div>
-    <div id="nowPlaying" class="now-playing">Pick a song to start listening.</div>
-    <div id="results"></div>
-    <div class="footer-note">Tip: only one preview plays at a time.</div>
-  </div>
+  </header>
+
+  <main class="workspace">
+    <section class="main-column">
+      <div class="hero">
+        <h1>Discover tracks, lyrics, and artist discographies</h1>
+        <p>Powered by Go concurrency and the iTunes Search API — preview tracks with vinyl pitch control, synced lyrics, artist deep-dives, and blind listening trivia.</p>
+      </div>
+
+      <div class="search-bar">
+        <input id="query" type="search" placeholder="Search artist, song, or album (e.g. Daft Punk, Kendrick Lamar, Radiohead)..." onkeydown="if(event.key==='Enter') search()">
+        <button type="button" class="btn-primary" onclick="search()">Search Catalog</button>
+      </div>
+
+      <div class="quick-curations" aria-label="Quick artist curations">
+        <span class="curation-label">Quick explore:</span>
+        <button type="button" class="curation-btn" onclick="quickSearch('Daft Punk')">Daft Punk</button>
+        <button type="button" class="curation-btn" onclick="quickSearch('The Weeknd')">The Weeknd</button>
+        <button type="button" class="curation-btn" onclick="quickSearch('Tame Impala')">Tame Impala</button>
+        <button type="button" class="curation-btn" onclick="quickSearch('Fleetwood Mac')">Fleetwood Mac</button>
+        <button type="button" class="curation-btn" onclick="quickSearch('Nujabes')">Nujabes</button>
+      </div>
+
+      <div id="view-discover" class="view-section">
+        <div class="results-toolbar">
+          <span class="results-count mono-num" id="resultsCount">No results yet</span>
+          <div class="toolbar-controls">
+            <input id="filterInput" type="search" placeholder="Filter loaded tracks..." oninput="filterResults()">
+            <select id="sortSelect" aria-label="Sort results" onchange="filterResults()">
+              <option value="default">Sort: Relevance</option>
+              <option value="year-desc">Sort: Newest First</option>
+              <option value="year-asc">Sort: Oldest First</option>
+              <option value="duration-desc">Sort: Longest Track</option>
+            </select>
+            <label class="toggle-label">
+              <input type="checkbox" id="autoPlayToggle" checked>
+              <span>Continuous Queue</span>
+            </label>
+          </div>
+        </div>
+
+        <div id="artistSpotlight" class="artist-spotlight hidden" aria-live="polite"></div>
+
+        <div id="results" class="track-list"></div>
+      </div>
+
+      <div id="view-quiz" class="view-section hidden">
+        <div class="quiz-panel">
+          <div class="quiz-header">
+            <div>
+              <h2>Blind Audio Listening Quiz</h2>
+              <p class="quiz-subtitle">Listen to the mystery 30-second audio preview from your current search pool and identify the track before the clip ends.</p>
+            </div>
+            <div class="quiz-scoreboard">
+              <div class="score-item">
+                <span class="score-label">Score</span>
+                <strong id="quizScore" class="mono-num">0 / 0</strong>
+              </div>
+              <div class="score-item">
+                <span class="score-label">Streak</span>
+                <strong id="quizStreak" class="mono-num">0</strong>
+              </div>
+            </div>
+          </div>
+
+          <div id="quizBody" class="quiz-body"></div>
+        </div>
+      </div>
+
+      <div id="view-crate" class="view-section hidden">
+        <div class="crate-header">
+          <div>
+            <h2>Your Saved Crate</h2>
+            <p class="crate-subtitle">Bookmark favorite tracks across searches, play them as a continuous mix, or export as an M3U playlist file.</p>
+          </div>
+          <div class="crate-actions">
+            <button type="button" class="btn-secondary" onclick="playAllCrate()">Play Entire Crate</button>
+            <button type="button" class="btn-ghost" onclick="clearCrate()">Clear Crate</button>
+          </div>
+        </div>
+        <div id="crateResults" class="track-list"></div>
+      </div>
+    </section>
+
+    <aside class="studio-sidebar">
+      <div class="deck-panel">
+        <div class="deck-header">
+          <span class="deck-kicker">Listening Deck</span>
+          <span id="deckQueuePos" class="mono-num deck-pos">Idle</span>
+        </div>
+
+        <div class="deck-visual">
+          <div id="deckArtworkWrap" class="deck-artwork-fallback">
+            <svg viewBox="0 0 24 24" width="36" height="36" stroke="currentColor" stroke-width="1.5" fill="none" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"></circle>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+          </div>
+          <div class="deck-meta">
+            <div id="nowPlaying" class="now-playing">Pick a song to start listening.</div>
+            <div id="deckSubMeta" class="deck-submeta">Select any track from the catalog to inspect audio &amp; lyrics.</div>
+          </div>
+        </div>
+
+        <canvas id="visualizerCanvas" class="visualizer-canvas" width="340" height="64" aria-label="Audio frequency spectrum visualizer"></canvas>
+
+        <div class="scrubber-row">
+          <span id="currentTimeLabel" class="mono-num time-label">0:00</span>
+          <input id="seekSlider" type="range" min="0" max="100" value="0" step="0.1" aria-label="Seek audio position">
+          <span id="durationTimeLabel" class="mono-num time-label">0:30</span>
+        </div>
+
+        <div class="transport-row">
+          <button type="button" class="transport-btn" onclick="playAdjacentTrack(-1)" title="Previous track in list">⏮ Prev</button>
+          <button type="button" id="masterPlayBtn" class="transport-btn transport-primary" onclick="toggleMasterPlayback()">▶ Play</button>
+          <button type="button" class="transport-btn" onclick="playAdjacentTrack(1)" title="Next track in list">Next ⏭</button>
+        </div>
+
+        <div class="pitch-controls" role="group" aria-label="Vinyl playback speed and pitch">
+          <span class="pitch-label">Vinyl Speed:</span>
+          <div class="segmented-group">
+            <button type="button" class="seg-btn" data-rate="0.85" onclick="setPlaybackSpeed(0.85)">0.85x Slowed</button>
+            <button type="button" class="seg-btn active" data-rate="1" onclick="setPlaybackSpeed(1)">1.0x Studio</button>
+            <button type="button" class="seg-btn" data-rate="1.18" onclick="setPlaybackSpeed(1.18)">1.18x Nightcore</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="lyrics-panel" class="lyrics-panel">
+        <div class="lyrics-header">
+          <div>
+            <h3>Lyrics Studio</h3>
+            <p id="lyricsTrackLabel" class="lyrics-sub">Select a song to load full lyrics</p>
+          </div>
+          <button type="button" id="copyLyricsBtn" class="btn-ghost btn-sm hidden" onclick="copyCurrentLyrics()">Copy</button>
+        </div>
+        <div id="lyricsContent" class="lyrics-content">
+          <div class="lyrics-empty">Full and time-synced lyrics fetched via the Go backend (`/lyrics`) appear here automatically when you play or inspect a track.</div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="footer-note">
+    <span>Built with Go (`net/http`, `sync.WaitGroup` concurrency) &amp; Apple iTunes Search API · Audio previews sync automatically with the Studio Deck.</span>
+  </footer>
 
   <script src="script.js"></script>
 </body>

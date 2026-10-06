@@ -17,14 +17,32 @@ import (
 )
 
 type Track struct {
-	TrackName        string `json:"trackName"`
-	ArtistName       string `json:"artistName"`
-	PreviewURL       string `json:"previewUrl"`
-	ArtworkURL100    string `json:"artworkUrl100"`
-	TrackViewURL     string `json:"trackViewUrl"`
-	CollectionName   string `json:"collectionName"`
-	PrimaryGenreName string `json:"primaryGenreName,omitempty"`
-	TrackTimeMillis  int64  `json:"trackTimeMillis,omitempty"`
+	TrackID          int64   `json:"trackId"`
+	ArtistID         int64   `json:"artistId"`
+	CollectionID     int64   `json:"collectionId"`
+	TrackName        string  `json:"trackName"`
+	ArtistName       string  `json:"artistName"`
+	PreviewURL       string  `json:"previewUrl"`
+	ArtworkURL100    string  `json:"artworkUrl100"`
+	ArtworkURL600    string  `json:"artworkUrl600"`
+	TrackViewURL     string  `json:"trackViewUrl"`
+	CollectionName   string  `json:"collectionName"`
+	PrimaryGenreName string  `json:"primaryGenreName,omitempty"`
+	TrackTimeMillis  int64   `json:"trackTimeMillis,omitempty"`
+	ReleaseDate      string  `json:"releaseDate,omitempty"`
+	TrackPrice       float64 `json:"trackPrice,omitempty"`
+	Currency         string  `json:"currency,omitempty"`
+}
+
+type Album struct {
+	CollectionID   int64  `json:"collectionId"`
+	CollectionName string `json:"collectionName"`
+	ArtistName     string `json:"artistName"`
+	ArtworkURL100  string `json:"artworkUrl100"`
+	ReleaseDate    string `json:"releaseDate"`
+	TrackCount     int    `json:"trackCount"`
+	PrimaryGenre   string `json:"primaryGenreName"`
+	CollectionURL  string `json:"collectionViewUrl"`
 }
 
 type iTunesResponse struct {
@@ -32,13 +50,46 @@ type iTunesResponse struct {
 	Results     []Track `json:"results"`
 }
 
+type iTunesAlbumResponse struct {
+	ResultCount int     `json:"resultCount"`
+	Results     []Album `json:"results"`
+}
+
+type ArtistProfileResponse struct {
+	ArtistName string  `json:"artistName"`
+	TopTracks  []Track `json:"topTracks"`
+	Albums     []Album `json:"albums"`
+}
+
+type LrcLibItem struct {
+	TrackName    string `json:"trackName"`
+	ArtistName   string `json:"artistName"`
+	AlbumName    string `json:"albumName"`
+	PlainLyrics  string `json:"plainLyrics"`
+	SyncedLyrics string `json:"syncedLyrics"`
+}
+
+type LyricsResponse struct {
+	TrackName    string `json:"trackName"`
+	ArtistName   string `json:"artistName"`
+	PlainLyrics  string `json:"plainLyrics"`
+	SyncedLyrics string `json:"syncedLyrics"`
+	Found        bool   `json:"found"`
+}
+
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
 }
 
+func setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
 func fetchTracks(query string, limit int) ([]Track, error) {
 	if limit <= 0 || limit > 50 {
-		limit = 12
+		limit = 20
 	}
 
 	searchURL := fmt.Sprintf(
@@ -67,7 +118,7 @@ func fetchTracks(query string, limit int) ([]Track, error) {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Normalize artwork URLs concurrently using goroutines
+	// Normalize metadata and upgrade artwork resolution concurrently using goroutines
 	var wg sync.WaitGroup
 	results := make([]Track, len(data.Results))
 	for i, track := range data.Results {
@@ -77,6 +128,9 @@ func fetchTracks(query string, limit int) ([]Track, error) {
 			t.TrackName = strings.TrimSpace(t.TrackName)
 			t.ArtistName = strings.TrimSpace(t.ArtistName)
 			t.CollectionName = strings.TrimSpace(t.CollectionName)
+			if t.ArtworkURL100 != "" {
+				t.ArtworkURL600 = strings.Replace(t.ArtworkURL100, "100x100bb", "600x600bb", 1)
+			}
 			results[idx] = t
 		}(i, track)
 	}
@@ -86,10 +140,7 @@ func fetchTracks(query string, limit int) ([]Track, error) {
 }
 
 func searchHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
+	setCORSHeaders(w)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -101,7 +152,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tracks, err := fetchTracks(query, 12)
+	tracks, err := fetchTracks(query, 20)
 	if err != nil {
 		log.Printf("search error for %q: %v", query, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -109,9 +160,138 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(tracks); err != nil {
-		log.Printf("failed to encode response: %v", err)
+	json.NewEncoder(w).Encode(tracks)
+}
+
+func artistHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
+
+	artistName := strings.TrimSpace(r.URL.Query().Get("name"))
+	if artistName == "" {
+		http.Error(w, "missing query param 'name'", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		topTracks []Track
+		albums    []Album
+		wg        sync.WaitGroup
+	)
+
+	wg.Add(2)
+
+	// Goroutine 1: Fetch top songs for artist
+	go func() {
+		defer wg.Done()
+		tracks, err := fetchTracks(artistName, 10)
+		if err == nil {
+			topTracks = tracks
+		}
+	}()
+
+	// Goroutine 2: Fetch albums / discography for artist
+	go func() {
+		defer wg.Done()
+		albumURL := fmt.Sprintf(
+			"https://itunes.apple.com/search?term=%s&media=music&entity=album&limit=8",
+			url.QueryEscape(artistName),
+		)
+		resp, err := httpClient.Get(albumURL)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
+
+		var data iTunesAlbumResponse
+		if err := json.Unmarshal(body, &data); err == nil {
+			albums = data.Results
+		}
+	}()
+
+	wg.Wait()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ArtistProfileResponse{
+		ArtistName: artistName,
+		TopTracks:  topTracks,
+		Albums:     albums,
+	})
+}
+
+func lyricsHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	track := strings.TrimSpace(r.URL.Query().Get("track"))
+	artist := strings.TrimSpace(r.URL.Query().Get("artist"))
+	if track == "" || artist == "" {
+		http.Error(w, "missing 'track' or 'artist' query param", http.StatusBadRequest)
+		return
+	}
+
+	searchURL := fmt.Sprintf(
+		"https://lrclib.net/api/search?track_name=%s&artist_name=%s",
+		url.QueryEscape(track),
+		url.QueryEscape(artist),
+	)
+
+	req, err := http.NewRequest(http.MethodGet, searchURL, nil)
+	if err != nil {
+		http.Error(w, "failed to create request", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("User-Agent", "Go-iTunes-Music-Explorer/1.0")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(LyricsResponse{TrackName: track, ArtistName: artist, Found: false})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(LyricsResponse{TrackName: track, ArtistName: artist, Found: false})
+		return
+	}
+
+	var items []LrcLibItem
+	if err := json.Unmarshal(body, &items); err == nil && len(items) > 0 {
+		for _, item := range items {
+			if item.PlainLyrics != "" || item.SyncedLyrics != "" {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(LyricsResponse{
+					TrackName:    item.TrackName,
+					ArtistName:   item.ArtistName,
+					PlainLyrics:  item.PlainLyrics,
+					SyncedLyrics: item.SyncedLyrics,
+					Found:        true,
+				})
+				return
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(LyricsResponse{
+		TrackName:  track,
+		ArtistName: artist,
+		Found:      false,
+	})
 }
 
 func resolveClientDir() string {
@@ -182,6 +362,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search", searchHandler)
+	mux.HandleFunc("/artist", artistHandler)
+	mux.HandleFunc("/lyrics", lyricsHandler)
 	mux.Handle("/", http.FileServer(http.Dir(clientDir)))
 
 	log.Printf("Serving client from: %s", clientDir)
