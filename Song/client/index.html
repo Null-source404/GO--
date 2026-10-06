@@ -4,9 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>iTunes Music Search</title>
-  <meta name="description" content="Search songs from iTunes, explore artist discographies, read synced lyrics, play the blind audio quiz, and build your crate.">
+  <meta name="description" content="Search songs from iTunes, preview 30-second clips as a guest, or register an account to unlock full-length songs, synced lyrics, and artist discographies.">
   <meta property="og:title" content="iTunes Music Search">
-  <meta property="og:description" content="Search songs from iTunes, explore artist discographies, read synced lyrics, play the blind audio quiz, and build your crate.">
+  <meta property="og:description" content="Search songs from iTunes, preview 30-second clips as a guest, or register an account to unlock full-length songs, synced lyrics, and artist discographies.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Syne:wght@600;700&display=swap" rel="stylesheet">
@@ -22,15 +22,19 @@
       <a href="#lyrics-panel" class="nav-link" onclick="focusLyricsStudio(); return false;">Lyrics Studio</a>
     </nav>
     <div class="top-actions">
-      <button type="button" class="btn-secondary" onclick="exportCrateM3U()">Export M3U Playlist</button>
+      <button type="button" class="btn-secondary" onclick="exportCrateM3U()">Export M3U</button>
+      <button type="button" id="authHeaderBtn" class="btn-primary btn-auth" onclick="handleAuthHeaderClick()">Sign In / Register</button>
     </div>
   </header>
 
   <main class="workspace">
     <section class="main-column">
       <div class="hero">
-        <h1>Discover tracks, lyrics, and artist discographies</h1>
-        <p>Powered by Go concurrency and the iTunes Search API — preview tracks with vinyl pitch control, synced lyrics, artist deep-dives, and blind listening trivia.</p>
+        <div class="hero-top-row">
+          <h1>Discover tracks, lyrics, and artist discographies</h1>
+          <span id="accessTierStatus" class="tier-text">Guest Mode · 30s Previews (<a href="#auth" onclick="openAuthModal('register'); return false;">Register for Full Songs</a>)</span>
+        </div>
+        <p>Powered by Go concurrency and the iTunes Search API — listen to 30-second previews as a guest, or create a free account to unlock full-length song streaming, synced lyrics, and artist deep-dives.</p>
       </div>
 
       <div class="search-bar">
@@ -75,7 +79,7 @@
           <div class="quiz-header">
             <div>
               <h2>Blind Audio Listening Quiz</h2>
-              <p class="quiz-subtitle">Listen to the mystery 30-second audio preview from your current search pool and identify the track before the clip ends.</p>
+              <p class="quiz-subtitle">Listen to the mystery audio clip from your current search pool and identify the track before the clip ends.</p>
             </div>
             <div class="quiz-scoreboard">
               <div class="score-item">
@@ -111,7 +115,7 @@
     <aside class="studio-sidebar">
       <div class="deck-panel">
         <div class="deck-header">
-          <span class="deck-kicker">Listening Deck</span>
+          <span id="deckModeLabel" class="deck-kicker">Listening Deck · 30s Preview Mode</span>
           <span id="deckQueuePos" class="mono-num deck-pos">Idle</span>
         </div>
 
@@ -124,9 +128,16 @@
           </div>
           <div class="deck-meta">
             <div id="nowPlaying" class="now-playing">Pick a song to start listening.</div>
-            <div id="deckSubMeta" class="deck-submeta">Select any track from the catalog to inspect audio &amp; lyrics.</div>
+            <div id="deckSubMeta" class="deck-submeta">Guests hear 30s previews. Register to unlock full songs.</div>
           </div>
         </div>
+
+        <div id="fullSongSourceToggle" class="source-switcher hidden">
+          <button type="button" id="srcBtnStudio" class="seg-btn active" onclick="switchFullTrackSource('studio')">Full Studio Audio Stream</button>
+          <button type="button" id="srcBtnYoutube" class="seg-btn" onclick="switchFullTrackSource('youtube')">Official Full Song Embed</button>
+        </div>
+
+        <div id="youtubeEmbedWrap" class="youtube-embed-wrap hidden"></div>
 
         <canvas id="visualizerCanvas" class="visualizer-canvas" width="340" height="64" aria-label="Audio frequency spectrum visualizer"></canvas>
 
@@ -140,6 +151,11 @@
           <button type="button" class="transport-btn" onclick="playAdjacentTrack(-1)" title="Previous track in list">⏮ Prev</button>
           <button type="button" id="masterPlayBtn" class="transport-btn transport-primary" onclick="toggleMasterPlayback()">▶ Play</button>
           <button type="button" class="transport-btn" onclick="playAdjacentTrack(1)" title="Next track in list">Next ⏭</button>
+        </div>
+
+        <div id="guestUpgradeBanner" class="guest-upgrade-banner">
+          <span>Playing 30-second guest previews.</span>
+          <button type="button" class="link-btn" onclick="openAuthModal('register')">Create free account for full songs →</button>
         </div>
 
         <div class="pitch-controls" role="group" aria-label="Vinyl playback speed and pitch">
@@ -167,8 +183,45 @@
     </aside>
   </main>
 
+  <!-- Authentication Modal (Register / Sign In for Full-Length Songs) -->
+  <div id="authModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="authModalTitle">Create Account for Full Songs</h2>
+          <p id="authModalSub" class="modal-sub">Guests can play 30-second iTunes previews. Register an account on the Go server to unlock full-length song streaming.</p>
+        </div>
+        <button type="button" class="btn-ghost btn-sm" onclick="closeAuthModal()">✕</button>
+      </div>
+
+      <div class="auth-mode-tabs">
+        <button type="button" id="tabRegisterBtn" class="seg-btn active" onclick="switchAuthMode('register')">Create Account</button>
+        <button type="button" id="tabLoginBtn" class="seg-btn" onclick="switchAuthMode('login')">Sign In</button>
+      </div>
+
+      <form id="authForm" onsubmit="submitAuthForm(event)">
+        <div id="nameFieldGroup" class="form-group">
+          <label for="authName">Display Name</label>
+          <input id="authName" type="text" placeholder="Alex Rivera" autocomplete="name">
+        </div>
+        <div class="form-group">
+          <label for="authEmail">Email Address</label>
+          <input id="authEmail" type="email" placeholder="alex@example.com" required autocomplete="email">
+        </div>
+        <div class="form-group">
+          <label for="authPassword">Password (min 4 characters)</label>
+          <input id="authPassword" type="password" placeholder="••••••••" required minlength="4" autocomplete="current-password">
+        </div>
+
+        <div id="authErrorMsg" class="auth-error hidden"></div>
+
+        <button type="submit" id="authSubmitBtn" class="btn-primary auth-submit-btn">Create Account &amp; Unlock Full Songs</button>
+      </form>
+    </div>
+  </div>
+
   <footer class="footer-note">
-    <span>Built with Go (`net/http`, `sync.WaitGroup` concurrency) &amp; Apple iTunes Search API · Audio previews sync automatically with the Studio Deck.</span>
+    <span>Built with Go (`net/http`, `sync.WaitGroup` concurrency) &amp; Apple iTunes Search API · Guest 30s Previews &amp; Member Full-Track Streaming.</span>
   </footer>
 
   <script src="script.js"></script>

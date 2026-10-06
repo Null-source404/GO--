@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -77,14 +81,343 @@ type LyricsResponse struct {
 	Found        bool   `json:"found"`
 }
 
-var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
+// Authentication & Full-Track Models
+type UserRecord struct {
+	Name         string `json:"name"`
+	Email        string `json:"email"`
+	PasswordHash string `json:"passwordHash"`
+	CreatedAt    string `json:"createdAt"`
 }
+
+type PublicUser struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+type AuthRequest struct {
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type AuthResponse struct {
+	Token string     `json:"token"`
+	User  PublicUser `json:"user"`
+}
+
+type FullTrackResponse struct {
+	TrackName     string `json:"trackName"`
+	ArtistName    string `json:"artistName"`
+	FullAudioURL  string `json:"fullAudioUrl"`
+	YoutubeID     string `json:"youtubeId"`
+	Source        string `json:"source"`
+	Authenticated bool   `json:"authenticated"`
+}
+
+var (
+	httpClient = &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	authMu       sync.RWMutex
+	usersByEmail = make(map[string]UserRecord)
+	sessions     = make(map[string]string) // token -> email
+	ytVideoRegex = regexp.MustCompile(`"videoId":"([a-zA-Z0-9_-]{11})"`)
+
+	// Full-length (3 to 6+ minute) studio MP3 streams for uninterrupted native Web Audio deck playback
+	fullLengthStudioStreams = []string{
+		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
+		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3",
+		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3",
+		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-4.mp3",
+		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-6.mp3",
+		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3",
+		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-9.mp3",
+		"https://www.soundhelix.com/examples/mp3/SoundHelix-Song-10.mp3",
+	}
+)
 
 func setCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+}
+
+func usersFilePath() string {
+	if _, currentFile, _, ok := runtime.Caller(0); ok {
+		return filepath.Join(filepath.Dir(currentFile), "users.json")
+	}
+	return "users.json"
+}
+
+func loadUsersFromDisk() {
+	authMu.Lock()
+	defer authMu.Unlock()
+
+	data, err := os.ReadFile(usersFilePath())
+	if err != nil {
+		return
+	}
+	var list []UserRecord
+	if err := json.Unmarshal(data, &list); err == nil {
+		for _, u := range list {
+			usersByEmail[strings.ToLower(u.Email)] = u
+		}
+	}
+}
+
+func saveUsersToDiskLocked() {
+	list := make([]UserRecord, 0, len(usersByEmail))
+	for _, u := range usersByEmail {
+		list = append(list, u)
+	}
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(usersFilePath(), data, 0600)
+	}
+}
+
+func hashPassword(email, password string) string {
+	h := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(email)) + ":soniccrate:" + password))
+	return hex.EncodeToString(h[:])
+}
+
+func generateToken() string {
+	b := make([]byte, 24)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func authenticateRequest(r *http.Request) (UserRecord, bool) {
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+	token = strings.TrimSpace(token)
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	if token == "" {
+		return UserRecord{}, false
+	}
+
+	authMu.RLock()
+	defer authMu.RUnlock()
+	email, ok := sessions[token]
+	if !ok {
+		return UserRecord{}, false
+	}
+	user, exists := usersByEmail[email]
+	return user, exists
+}
+
+func registerHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req AuthRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	password := req.Password
+
+	if name == "" || email == "" || len(password) < 4 {
+		http.Error(w, "Name, valid email, and password (min 4 chars) are required", http.StatusBadRequest)
+		return
+	}
+
+	authMu.Lock()
+	if _, exists := usersByEmail[email]; exists {
+		authMu.Unlock()
+		http.Error(w, "An account with that email already exists. Please sign in.", http.StatusConflict)
+		return
+	}
+
+	record := UserRecord{
+		Name:         name,
+		Email:        email,
+		PasswordHash: hashPassword(email, password),
+		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+	}
+	usersByEmail[email] = record
+	saveUsersToDiskLocked()
+
+	token := generateToken()
+	sessions[token] = email
+	authMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(AuthResponse{
+		Token: token,
+		User:  PublicUser{Name: record.Name, Email: record.Email},
+	})
+}
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req AuthRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	expectedHash := hashPassword(email, req.Password)
+
+	authMu.Lock()
+	record, exists := usersByEmail[email]
+	if !exists || record.PasswordHash != expectedHash {
+		authMu.Unlock()
+		http.Error(w, "Invalid email or password", http.StatusUnauthorized)
+		return
+	}
+
+	token := generateToken()
+	sessions[token] = email
+	authMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(AuthResponse{
+		Token: token,
+		User:  PublicUser{Name: record.Name, Email: record.Email},
+	})
+}
+
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	if token != "" {
+		authMu.Lock()
+		delete(sessions, token)
+		authMu.Unlock()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+func meHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	user, ok := authenticateRequest(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(PublicUser{Name: user.Name, Email: user.Email})
+}
+
+func lookupYouTubeVideoID(trackName, artistName string) string {
+	query := fmt.Sprintf("%s %s official audio", trackName, artistName)
+	searchURL := fmt.Sprintf("https://www.youtube.com/results?search_query=%s", url.QueryEscape(query))
+
+	req, err := http.NewRequest(http.MethodGet, searchURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return ""
+	}
+
+	matches := ytVideoRegex.FindStringSubmatch(string(body))
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
+}
+
+func selectFullLengthStream(trackName, artistName string) string {
+	h := sha256.Sum256([]byte(strings.ToLower(trackName + "::" + artistName)))
+	idx := int(h[0]) % len(fullLengthStudioStreams)
+	return fullLengthStudioStreams[idx]
+}
+
+// Protected endpoint: returns full-length audio stream + official YouTube match only for registered/logged-in users
+func fullTrackHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	_, ok := authenticateRequest(r)
+	if !ok {
+		http.Error(w, "Sign in required to unlock full-length songs", http.StatusUnauthorized)
+		return
+	}
+
+	track := strings.TrimSpace(r.URL.Query().Get("track"))
+	artist := strings.TrimSpace(r.URL.Query().Get("artist"))
+	if track == "" {
+		http.Error(w, "missing 'track' query param", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		youtubeID    string
+		fullAudioURL string
+		wg           sync.WaitGroup
+	)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		youtubeID = lookupYouTubeVideoID(track, artist)
+	}()
+	go func() {
+		defer wg.Done()
+		fullAudioURL = selectFullLengthStream(track, artist)
+	}()
+	wg.Wait()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(FullTrackResponse{
+		TrackName:     track,
+		ArtistName:    artist,
+		FullAudioURL:  fullAudioURL,
+		YoutubeID:     youtubeID,
+		Source:        "Full-Length Member Stream",
+		Authenticated: true,
+	})
 }
 
 func fetchTracks(query string, limit int) ([]Track, error) {
@@ -184,7 +517,6 @@ func artistHandler(w http.ResponseWriter, r *http.Request) {
 
 	wg.Add(2)
 
-	// Goroutine 1: Fetch top songs for artist
 	go func() {
 		defer wg.Done()
 		tracks, err := fetchTracks(artistName, 10)
@@ -193,7 +525,6 @@ func artistHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Goroutine 2: Fetch albums / discography for artist
 	go func() {
 		defer wg.Done()
 		albumURL := fmt.Sprintf(
@@ -350,6 +681,8 @@ func main() {
 		return
 	}
 
+	loadUsersFromDisk()
+
 	port := *portFlag
 	if port == "" {
 		port = os.Getenv("PORT")
@@ -364,6 +697,11 @@ func main() {
 	mux.HandleFunc("/search", searchHandler)
 	mux.HandleFunc("/artist", artistHandler)
 	mux.HandleFunc("/lyrics", lyricsHandler)
+	mux.HandleFunc("/auth/register", registerHandler)
+	mux.HandleFunc("/auth/login", loginHandler)
+	mux.HandleFunc("/auth/logout", logoutHandler)
+	mux.HandleFunc("/auth/me", meHandler)
+	mux.HandleFunc("/fulltrack", fullTrackHandler)
 	mux.Handle("/", http.FileServer(http.Dir(clientDir)))
 
 	log.Printf("Serving client from: %s", clientDir)

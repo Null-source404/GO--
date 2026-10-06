@@ -1,5 +1,6 @@
 node_modules/
 Song/server/itunes-search
+Song/server/users.json
 Song/itunes-search
 itunes-search
 *.exe
