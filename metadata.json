@@ -1,0 +1,5 @@
+{
+  "name": "iTunes Music Search",
+  "description": "Search songs from iTunes and preview audio tracks instantly.",
+  "requestFramePermissions": []
+}

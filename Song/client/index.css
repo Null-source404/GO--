@@ -154,6 +154,18 @@ button:active {
   background: #0ea5e9;
 }
 
+.itunes-link {
+  color: #93c5fd;
+  font-size: 0.88rem;
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.itunes-link:hover {
+  text-decoration: underline;
+  color: #bfdbfe;
+}
+
 audio {
   width: 100%;
   margin-top: 0.4rem;
