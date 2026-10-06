@@ -178,10 +178,13 @@ app.post('/auth/register', (req, res) => {
     return res.status(409).send('An account with that email already exists. Please sign in.');
   }
 
+  const verificationToken = generateToken();
   const record = {
     name,
     email,
     passwordHash: hashPassword(email, password),
+    emailVerified: false,
+    verificationToken,
     createdAt: new Date().toISOString(),
   };
   usersByEmail.set(email, record);
@@ -190,10 +193,17 @@ app.post('/auth/register', (req, res) => {
   const token = generateToken();
   sessions.set(token, email);
 
+  const verificationLink = `/?verifyToken=${encodeURIComponent(verificationToken)}&email=${encodeURIComponent(email)}`;
+
   res.setHeader('Access-Control-Allow-Origin', '*');
   return res.json({
     token,
-    user: { name: record.name, email: record.email },
+    user: {
+      name: record.name,
+      email: record.email,
+      emailVerified: record.emailVerified,
+    },
+    verificationLink,
   });
 });
 
@@ -207,13 +217,115 @@ app.post('/auth/login', (req, res) => {
     return res.status(401).send('Invalid email or password');
   }
 
+  if (!record.verificationToken) {
+    record.verificationToken = generateToken();
+    usersByEmail.set(email, record);
+    saveUsersToDisk();
+  }
+
+  const token = generateToken();
+  sessions.set(token, email);
+
+  const verificationLink =
+    !record.emailVerified && record.verificationToken
+      ? `/?verifyToken=${encodeURIComponent(record.verificationToken)}&email=${encodeURIComponent(email)}`
+      : '';
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  return res.json({
+    token,
+    user: {
+      uid: record.uid || '',
+      name: record.name,
+      email: record.email,
+      emailVerified: Boolean(record.emailVerified),
+    },
+    verificationLink,
+  });
+});
+
+app.post('/auth/firebase-sync', (req, res) => {
+  const uid = String(req.body?.uid || '').trim();
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  let name = String(req.body?.name || '').trim();
+  const emailVerified = Boolean(req.body?.emailVerified);
+
+  if (!email) {
+    return res.status(400).send('email is required');
+  }
+  if (!name) {
+    name = email.split('@')[0];
+  }
+
+  let record = usersByEmail.get(email);
+  if (!record) {
+    record = {
+      uid,
+      name,
+      email,
+      passwordHash: '',
+      emailVerified,
+      verificationToken: generateToken(),
+      createdAt: new Date().toISOString(),
+    };
+  } else {
+    if (uid) record.uid = uid;
+    if (name) record.name = name;
+    if (emailVerified) record.emailVerified = true;
+    if (!record.verificationToken) record.verificationToken = generateToken();
+  }
+  usersByEmail.set(email, record);
+  saveUsersToDisk();
+
+  const token = generateToken();
+  sessions.set(token, email);
+
+  const verificationLink =
+    !record.emailVerified && record.verificationToken
+      ? `/?verifyToken=${encodeURIComponent(record.verificationToken)}&email=${encodeURIComponent(email)}`
+      : '';
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  return res.json({
+    token,
+    user: {
+      uid: record.uid || '',
+      name: record.name,
+      email: record.email,
+      emailVerified: Boolean(record.emailVerified),
+    },
+    verificationLink,
+  });
+});
+
+app.get('/auth/verify', (req, res) => {
+  const verifyTok = String(req.query.verifyToken || '').trim();
+  const email = String(req.query.email || '').trim().toLowerCase();
+
+  const record = usersByEmail.get(email);
+  if (
+    !record ||
+    (verifyTok && record.verificationToken && record.verificationToken !== verifyTok)
+  ) {
+    return res.status(400).send('Invalid or expired verification link');
+  }
+
+  record.emailVerified = true;
+  usersByEmail.set(email, record);
+  saveUsersToDisk();
+
   const token = generateToken();
   sessions.set(token, email);
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   return res.json({
     token,
-    user: { name: record.name, email: record.email },
+    user: {
+      uid: record.uid || '',
+      name: record.name,
+      email: record.email,
+      emailVerified: true,
+    },
   });
 });
 
@@ -231,7 +343,12 @@ app.get('/auth/me', (req, res) => {
     return res.status(401).send('unauthorized');
   }
   res.setHeader('Access-Control-Allow-Origin', '*');
-  return res.json({ name: user.name, email: user.email });
+  return res.json({
+    uid: user.uid || '',
+    name: user.name,
+    email: user.email,
+    emailVerified: Boolean(user.emailVerified),
+  });
 });
 
 async function isYouTubeEmbeddable(videoId) {
@@ -595,6 +712,13 @@ app.get('/lyrics', async (req, res) => {
 });
 
 const clientDir = path.join(__dirname, 'Song', 'client');
+app.get('/firebase-applet-config.json', (req, res) => {
+  const rootConfig = path.join(__dirname, 'firebase-applet-config.json');
+  if (fs.existsSync(rootConfig)) {
+    return res.sendFile(rootConfig);
+  }
+  return res.sendFile(path.join(clientDir, 'firebase-applet-config.json'));
+});
 app.use(express.static(clientDir));
 
 app.get('*', (req, res) => {

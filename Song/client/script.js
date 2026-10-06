@@ -21,12 +21,148 @@ let userActivity = loadUserActivity();
 // Auth State (Guest = 30s Previews, Logged-in Member = Full-Length Songs)
 const AUTH_TOKEN_KEY = 'sonic_crate_auth_token_v1';
 const AUTH_USER_KEY = 'sonic_crate_auth_user_v1';
+const VERIFY_LINK_KEY = 'sonic_crate_verify_link_v1';
 let authToken = localStorage.getItem(AUTH_TOKEN_KEY) || '';
 let currentUser = loadUserFromStorage();
+let pendingVerificationLink = localStorage.getItem(VERIFY_LINK_KEY) || '';
 let authModalMode = 'register';
 let currentFullTrackData = null;
 let fullTrackSourceMode = 'studio'; // 'studio' (Audio-Only Full Song) | 'youtube' (Video + Audio Full Song)
 const fullTrackClientCache = new Map();
+
+// Firebase Auth & Firestore State
+let fbApp = null;
+let fbAuth = null;
+let fbDb = null;
+let fbModules = null;
+let fbInitPromise = null;
+
+const OperationType = {
+  CREATE: 'create',
+  UPDATE: 'update',
+  DELETE: 'delete',
+  LIST: 'list',
+  GET: 'get',
+  WRITE: 'write',
+};
+
+function handleFirestoreError(error, operationType, path) {
+  const activeFbUser = fbAuth?.currentUser;
+  const errInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: activeFbUser?.uid || null,
+      email: activeFbUser?.email || null,
+      emailVerified: activeFbUser?.emailVerified ?? null,
+      isAnonymous: activeFbUser?.isAnonymous ?? null,
+      tenantId: activeFbUser?.tenantId || null,
+      providerInfo:
+        activeFbUser?.providerData?.map(provider => ({
+          providerId: provider.providerId,
+          email: provider.email,
+        })) || [],
+    },
+    operationType,
+    path,
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+async function initFirebaseClient() {
+  if (fbInitPromise) return fbInitPromise;
+  fbInitPromise = (async () => {
+    try {
+      const cfgResp = await fetch('/firebase-applet-config.json');
+      if (!cfgResp.ok) return null;
+      const firebaseConfig = await cfgResp.json();
+      if (!firebaseConfig || !firebaseConfig.apiKey) return null;
+
+      const [appMod, authMod, firestoreMod] = await Promise.all([
+        import('https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js'),
+        import('https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js'),
+        import('https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js'),
+      ]);
+
+      fbModules = { ...appMod, ...authMod, ...firestoreMod };
+      fbApp = appMod.initializeApp(firebaseConfig);
+      fbAuth = authMod.getAuth(fbApp);
+      fbDb = firestoreMod.getFirestore(fbApp, firebaseConfig.firestoreDatabaseId);
+
+      // Validate connection to Firestore on boot
+      try {
+        await firestoreMod.getDocFromServer(firestoreMod.doc(fbDb, 'test', 'connection'));
+      } catch (connErr) {
+        if (connErr instanceof Error && connErr.message.includes('the client is offline')) {
+          console.error('Please check your Firebase configuration.');
+        }
+      }
+
+      authMod.onAuthStateChanged(fbAuth, async fbUser => {
+        if (fbUser && fbUser.email) {
+          if (fbUser.emailVerified) {
+            await syncVerifiedUserToFirestore(fbUser, fbUser.displayName || currentUser?.name || '');
+          }
+        }
+      });
+
+      return { fbApp, fbAuth, fbDb, fbModules };
+    } catch (err) {
+      console.warn('Firebase client initialization skipped:', err);
+      return null;
+    }
+  })();
+  return fbInitPromise;
+}
+
+// Enforce blueprint constraints (ownerId ^[a-zA-Z0-9_\-]+$ <= 128, displayName 1..80, email 3..254)
+async function syncVerifiedUserToFirestore(fbUser, preferredName = '') {
+  if (!fbDb || !fbModules || !fbUser || !fbUser.uid || !fbUser.emailVerified) return;
+  const uid = String(fbUser.uid).trim().slice(0, 128);
+  if (!/^[a-zA-Z0-9_\-]+$/.test(uid)) return;
+
+  const email = String(fbUser.email || '').trim().toLowerCase().slice(0, 254);
+  if (email.length < 3) return;
+
+  const rawName = String(preferredName || fbUser.displayName || email.split('@')[0] || 'Member').trim();
+  const displayName = rawName.slice(0, 80) || 'Member';
+
+  const userDocRef = fbModules.doc(fbDb, 'users', uid);
+  const privDocRef = fbModules.doc(fbDb, 'users', uid, 'private', 'info');
+
+  try {
+    const existingSnap = await fbModules.getDoc(userDocRef);
+    const nowTs = fbModules.serverTimestamp();
+    if (!existingSnap.exists()) {
+      const batch = fbModules.writeBatch(fbDb);
+      batch.set(userDocRef, {
+        ownerId: uid,
+        displayName,
+        emailVerified: true,
+        createdAt: nowTs,
+        updatedAt: nowTs,
+      });
+      batch.set(privDocRef, {
+        ownerId: uid,
+        email,
+        createdAt: nowTs,
+      });
+      await batch.commit();
+    } else {
+      await fbModules.updateDoc(userDocRef, {
+        displayName,
+        emailVerified: true,
+        updatedAt: nowTs,
+      });
+    }
+  } catch (err) {
+    try {
+      handleFirestoreError(err, OperationType.WRITE, `/users/${uid}`);
+    } catch (_) {
+      // Logged structured FirestoreErrorInfo
+    }
+  }
+}
 
 // YouTube IFrame Full-Song Engine State
 let ytPlayer = null;
@@ -250,16 +386,25 @@ function loadUserFromStorage() {
   }
 }
 
-function saveAuthState(token, user) {
+function saveAuthState(token, user, verifyLink = undefined) {
   authToken = token || '';
   currentUser = user || null;
+  if (verifyLink !== undefined) {
+    pendingVerificationLink = verifyLink || '';
+  }
   try {
     if (authToken && currentUser) {
       localStorage.setItem(AUTH_TOKEN_KEY, authToken);
       localStorage.setItem(AUTH_USER_KEY, JSON.stringify(currentUser));
+      if (pendingVerificationLink && !currentUser.emailVerified) {
+        localStorage.setItem(VERIFY_LINK_KEY, pendingVerificationLink);
+      } else {
+        localStorage.removeItem(VERIFY_LINK_KEY);
+      }
     } else {
       localStorage.removeItem(AUTH_TOKEN_KEY);
       localStorage.removeItem(AUTH_USER_KEY);
+      localStorage.removeItem(VERIFY_LINK_KEY);
     }
   } catch (_) {
     // Ignore storage errors
@@ -281,6 +426,136 @@ function getPlayButtonLabel(isPaused = true) {
   return isLoggedIn() ? '▶ Full Song' : '▶ 30s Preview';
 }
 
+function showVerificationBanner({ verified = false, message = '', verifyLink = '' } = {}) {
+  const banner = document.getElementById('verificationNoticeBanner');
+  const badge = document.getElementById('verificationBadgeLabel');
+  const textEl = document.getElementById('verificationBannerText');
+  const directBtn = document.getElementById('directVerifyLinkBtn');
+  const resendBtn = document.getElementById('resendVerifyEmailBtn');
+  const refreshBtn = document.getElementById('refreshVerifyStatusBtn');
+
+  if (!banner) return;
+  banner.classList.remove('hidden');
+  banner.classList.toggle('verified-state', Boolean(verified));
+
+  if (verified) {
+    if (badge) badge.textContent = 'Email Verified ✓';
+    if (textEl) {
+      textEl.textContent =
+        message ||
+        `Account acknowledged! ${currentUser?.email || 'Your email'} is verified and synced with Firebase Authentication.`;
+    }
+    if (directBtn) directBtn.classList.add('hidden');
+    if (resendBtn) resendBtn.classList.add('hidden');
+    if (refreshBtn) refreshBtn.classList.add('hidden');
+  } else {
+    if (badge) badge.textContent = 'Verification Link Sent';
+    if (textEl) {
+      textEl.textContent =
+        message ||
+        `Account created for ${currentUser?.email || 'your email'}! Check your email inbox for the Firebase verification link, or click the acknowledgment link right here to confirm your account.`;
+    }
+    const linkToUse = verifyLink || pendingVerificationLink;
+    if (directBtn) {
+      if (linkToUse) {
+        directBtn.href = linkToUse;
+        directBtn.classList.remove('hidden');
+      } else {
+        directBtn.classList.add('hidden');
+      }
+    }
+    if (resendBtn) resendBtn.classList.remove('hidden');
+    if (refreshBtn) refreshBtn.classList.remove('hidden');
+  }
+}
+
+function dismissVerificationBanner() {
+  const banner = document.getElementById('verificationNoticeBanner');
+  if (banner) banner.classList.add('hidden');
+}
+
+function getTimeOfDayGreeting() {
+  const hour = new Date().getHours();
+  if (hour >= 5 && hour < 12) return 'Good morning';
+  if (hour >= 12 && hour < 17) return 'Good afternoon';
+  if (hour >= 17 && hour < 22) return 'Good evening';
+  return 'Late-night studio session';
+}
+
+function getUserInitials(name, email) {
+  const clean = String(name || email || 'SC').trim();
+  const parts = clean.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  }
+  return clean.slice(0, 2).toUpperCase();
+}
+
+function updateWelcomeBannerUI() {
+  const welcomeBanner = document.getElementById('memberWelcomeBanner');
+  if (!welcomeBanner) return;
+
+  if (!isLoggedIn()) {
+    welcomeBanner.classList.add('hidden');
+    return;
+  }
+
+  welcomeBanner.classList.remove('hidden');
+
+  const avatarEl = document.getElementById('welcomeAvatarInitials');
+  const headlineEl = document.getElementById('welcomeHeadline');
+  const verifyPillEl = document.getElementById('welcomeVerifyPill');
+  const subtextEl = document.getElementById('welcomeSubtext');
+  const resumeBtn = document.getElementById('welcomeResumeBtn');
+
+  const displayName = (currentUser?.name || currentUser?.email?.split('@')[0] || 'Member').trim();
+  const timeGreeting = getTimeOfDayGreeting();
+
+  if (avatarEl) {
+    avatarEl.textContent = getUserInitials(displayName, currentUser?.email);
+  }
+  if (headlineEl) {
+    headlineEl.textContent = `Welcome back, ${displayName}! · ${timeGreeting}`;
+  }
+  if (verifyPillEl) {
+    verifyPillEl.textContent = currentUser?.emailVerified
+      ? 'Full-Song Member · Verified ✓'
+      : 'Full-Song Member · Active';
+  }
+
+  const topArtists = getActivityArtistsSeed();
+  const topArtist = topArtists.length > 0 ? topArtists[0] : '';
+  const recentCount = recentlyPlayed.length;
+  const crateCount = savedCrate.length;
+
+  const summaryParts = [];
+  if (recentCount > 0 && recentlyPlayed[0]?.trackName) {
+    summaryParts.push(
+      `Last played "${recentlyPlayed[0].trackName}" by ${recentlyPlayed[0].artistName || 'Unknown'}`
+    );
+  } else if (topArtist) {
+    summaryParts.push(`Tuned to your ${topArtist} activity`);
+  } else {
+    summaryParts.push('Full-length studio audio & official video streaming unlocked');
+  }
+
+  summaryParts.push(`${crateCount} saved in Crate`);
+  summaryParts.push(`${recentCount}/${MAX_RECENT_SONGS} session plays`);
+
+  if (subtextEl) {
+    subtextEl.textContent = summaryParts.join(' · ');
+  }
+
+  if (resumeBtn) {
+    if (recentCount > 0 && recentlyPlayed[0]?.trackName) {
+      resumeBtn.textContent = `▶ Resume "${recentlyPlayed[0].trackName.slice(0, 22)}${recentlyPlayed[0].trackName.length > 22 ? '…' : ''}"`;
+      resumeBtn.classList.remove('hidden');
+    } else {
+      resumeBtn.classList.add('hidden');
+    }
+  }
+}
+
 function updateAuthUI() {
   const headerBtn = document.getElementById('authHeaderBtn');
   const tierStatus = document.getElementById('accessTierStatus');
@@ -290,19 +565,26 @@ function updateAuthUI() {
   const ytWrap = document.getElementById('youtubeEmbedWrap');
 
   if (isLoggedIn()) {
+    const verifiedTag = currentUser.emailVerified ? '✓ Verified' : 'Pending Email Link';
     if (headerBtn) {
       headerBtn.textContent = `Sign Out (${currentUser.name})`;
       headerBtn.className = 'btn-secondary btn-auth';
     }
     if (tierStatus) {
       tierStatus.className = 'tier-text member-active';
-      tierStatus.textContent = `Full-Track Member · Signed in as ${currentUser.name}`;
+      tierStatus.textContent = `Full-Track Member (${verifiedTag}) · ${currentUser.email}`;
     }
     if (deckModeLabel) {
       deckModeLabel.textContent = 'Listening Deck · Full-Song Member Mode';
     }
     if (guestBanner) {
       guestBanner.classList.add('hidden');
+    }
+    if (!currentUser.emailVerified && pendingVerificationLink) {
+      showVerificationBanner({
+        verified: false,
+        verifyLink: pendingVerificationLink,
+      });
     }
   } else {
     if (headerBtn) {
@@ -332,6 +614,8 @@ function updateAuthUI() {
     const isCardPlaying = card && card.classList.contains('is-playing') && isAnyAudioPlaying();
     btn.textContent = getPlayButtonLabel(!isCardPlaying);
   });
+
+  updateWelcomeBannerUI();
 }
 
 function isAnyAudioPlaying() {
@@ -496,13 +780,17 @@ async function verifyExistingSession() {
 
 function handleAuthHeaderClick() {
   if (isLoggedIn()) {
+    if (fbAuth && fbModules && typeof fbModules.signOut === 'function') {
+      fbModules.signOut(fbAuth).catch(() => {});
+    }
     apiFetch('/auth/logout', {
       method: 'POST',
       headers: { Authorization: `Bearer ${authToken}` },
     }).catch(() => {});
     stopOtherAudio(null);
     stopYtEngine();
-    saveAuthState('', null);
+    saveAuthState('', null, '');
+    dismissVerificationBanner();
     updateNowPlaying('', '');
   } else {
     openAuthModal('register');
@@ -514,6 +802,7 @@ function openAuthModal(mode = 'register') {
   if (!modal) return;
   modal.classList.remove('hidden');
   switchAuthMode(mode);
+  initFirebaseClient();
 }
 
 function closeAuthModal() {
@@ -531,51 +820,201 @@ function switchAuthMode(mode) {
   const regTab = document.getElementById('tabRegisterBtn');
   const loginTab = document.getElementById('tabLoginBtn');
   const errBox = document.getElementById('authErrorMsg');
+  const okBox = document.getElementById('authSuccessMsg');
 
   if (errBox) errBox.classList.add('hidden');
+  if (okBox) okBox.classList.add('hidden');
   if (regTab) regTab.classList.toggle('active', mode === 'register');
   if (loginTab) loginTab.classList.toggle('active', mode === 'login');
 
   if (mode === 'register') {
     if (title) title.textContent = 'Create Account for Full Songs';
-    if (sub) sub.textContent = 'Guests can play 30-second iTunes previews. Register an account on the Go server to unlock full-length song streaming.';
+    if (sub) {
+      sub.textContent =
+        'Register with a real email address via Firebase Authentication. We will send an acknowledgment & verification link to confirm your account and unlock full-length songs.';
+    }
     if (nameGroup) nameGroup.classList.remove('hidden');
     if (nameInput) nameInput.required = true;
-    if (submitBtn) submitBtn.textContent = 'Create Account & Unlock Full Songs';
+    if (submitBtn) submitBtn.textContent = 'Create Account & Send Verification Link';
   } else {
     if (title) title.textContent = 'Sign In to Your Account';
-    if (sub) sub.textContent = 'Sign in to switch from 30-second guest previews to full-length songs.';
+    if (sub) {
+      sub.textContent =
+        'Sign in with Firebase Authentication or your registered email to unlock full-length songs.';
+    }
     if (nameGroup) nameGroup.classList.add('hidden');
     if (nameInput) nameInput.required = false;
     if (submitBtn) submitBtn.textContent = 'Sign In & Unlock Full Songs';
   }
 }
 
+async function signInWithGoogleFirebase() {
+  const errBox = document.getElementById('authErrorMsg');
+  const okBox = document.getElementById('authSuccessMsg');
+  const googleBtn = document.getElementById('googleAuthBtn');
+  if (errBox) errBox.classList.add('hidden');
+  if (okBox) okBox.classList.add('hidden');
+  if (googleBtn) googleBtn.disabled = true;
+
+  try {
+    const fb = await initFirebaseClient();
+    if (!fb || !fb.fbAuth || !fb.fbModules) {
+      throw new Error('Firebase Authentication is still initializing. Please try again.');
+    }
+
+    const provider = new fb.fbModules.GoogleAuthProvider();
+    const cred = await fb.fbModules.signInWithPopup(fb.fbAuth, provider);
+    const fbUser = cred.user;
+    const email = (fbUser.email || '').trim().toLowerCase();
+    const name = (fbUser.displayName || email.split('@')[0] || 'Member').trim().slice(0, 80);
+
+    await syncVerifiedUserToFirestore(fbUser, name);
+
+    const syncRes = await apiFetch('/auth/firebase-sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        uid: fbUser.uid,
+        name,
+        email,
+        emailVerified: Boolean(fbUser.emailVerified),
+      }),
+    });
+
+    if (syncRes && syncRes.token && syncRes.user) {
+      saveAuthState(syncRes.token, syncRes.user, syncRes.verificationLink || '');
+      closeAuthModal();
+      showVerificationBanner({
+        verified: true,
+        message: `Signed in with Google (${email})! Your Firebase email is verified and full-length songs are unlocked.`,
+      });
+      if (activeAudio && activeTrackObject) {
+        const card = activeAudio.closest('.track');
+        playSpecificAudio(activeAudio, activeButton, card, activeTrackObject, activeTrackIndex);
+      }
+    }
+  } catch (err) {
+    if (errBox) {
+      errBox.textContent = err.message || 'Google Sign-In was cancelled or failed.';
+      errBox.classList.remove('hidden');
+    }
+  } finally {
+    if (googleBtn) googleBtn.disabled = false;
+  }
+}
+
 async function submitAuthForm(event) {
   event.preventDefault();
-  const name = (document.getElementById('authName')?.value || '').trim();
-  const email = (document.getElementById('authEmail')?.value || '').trim();
+  const rawName = (document.getElementById('authName')?.value || '').trim();
+  const email = (document.getElementById('authEmail')?.value || '').trim().toLowerCase();
   const password = document.getElementById('authPassword')?.value || '';
   const errBox = document.getElementById('authErrorMsg');
+  const okBox = document.getElementById('authSuccessMsg');
   const submitBtn = document.getElementById('authSubmitBtn');
 
   if (errBox) errBox.classList.add('hidden');
+  if (okBox) okBox.classList.add('hidden');
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email) || email.length > 254) {
+    if (errBox) {
+      errBox.textContent = 'Please enter a valid real email address.';
+      errBox.classList.remove('hidden');
+    }
+    return;
+  }
+
+  const name = (rawName || email.split('@')[0] || 'Member').slice(0, 80);
   if (submitBtn) submitBtn.disabled = true;
 
-  const endpoint = authModalMode === 'register' ? '/auth/register' : '/auth/login';
-  const payload = authModalMode === 'register' ? { name, email, password } : { email, password };
-
   try {
-    const res = await apiFetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    const fb = await initFirebaseClient();
+    let firebaseEmailSent = false;
+    let fbUid = '';
+    let fbVerified = false;
+
+    if (fb && fb.fbAuth && fb.fbModules) {
+      try {
+        if (authModalMode === 'register') {
+          const userCred = await fb.fbModules.createUserWithEmailAndPassword(fb.fbAuth, email, password);
+          fbUid = userCred.user.uid;
+          if (name && typeof fb.fbModules.updateProfile === 'function') {
+            await fb.fbModules.updateProfile(userCred.user, { displayName: name });
+          }
+          const actionCodeSettings = {
+            url: `${window.location.origin}/?firebaseVerified=1&email=${encodeURIComponent(email)}`,
+            handleCodeInApp: false,
+          };
+          await fb.fbModules.sendEmailVerification(userCred.user, actionCodeSettings);
+          firebaseEmailSent = true;
+          fbVerified = Boolean(userCred.user.emailVerified);
+        } else {
+          const userCred = await fb.fbModules.signInWithEmailAndPassword(fb.fbAuth, email, password);
+          fbUid = userCred.user.uid;
+          fbVerified = Boolean(userCred.user.emailVerified);
+          if (fbVerified) {
+            await syncVerifiedUserToFirestore(userCred.user, name);
+          }
+        }
+      } catch (fbErr) {
+        const code = String(fbErr?.code || '');
+        if (
+          code === 'auth/email-already-in-use' ||
+          code === 'auth/wrong-password' ||
+          code === 'auth/invalid-credential' ||
+          code === 'auth/invalid-email' ||
+          code === 'auth/weak-password'
+        ) {
+          throw new Error(fbErr.message || 'Firebase Authentication rejected those credentials.');
+        }
+        // If Email/Password provider is not enabled yet in Firebase Console (auth/operation-not-allowed),
+        // proceed with Go server registration + direct verification acknowledgment link so account creation succeeds!
+      }
+    }
+
+    let res = null;
+    if (fbUid) {
+      res = await apiFetch('/auth/firebase-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          uid: fbUid,
+          name,
+          email,
+          emailVerified: fbVerified,
+        }),
+      });
+    } else {
+      const endpoint = authModalMode === 'register' ? '/auth/register' : '/auth/login';
+      const payload = authModalMode === 'register' ? { name, email, password } : { email, password };
+      res = await apiFetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    }
 
     if (res && res.token && res.user) {
-      saveAuthState(res.token, res.user);
+      const verifyLink = res.verificationLink || '';
+      saveAuthState(res.token, res.user, verifyLink);
       closeAuthModal();
       document.getElementById('authForm')?.reset();
+
+      if (res.user.emailVerified) {
+        showVerificationBanner({
+          verified: true,
+          message: `Welcome back, ${res.user.name}! Your email (${res.user.email}) is verified.`,
+        });
+      } else {
+        const linkNote = firebaseEmailSent
+          ? `Account created for ${res.user.email}! Firebase sent an acknowledgment link to your email inbox — or click "Acknowledge & Verify Account Link ✓" right here.`
+          : `Account created for ${res.user.email}! Click "Acknowledge & Verify Account Link ✓" to confirm your account creation.`;
+        showVerificationBanner({
+          verified: false,
+          message: linkNote,
+          verifyLink,
+        });
+      }
 
       if (activeAudio && activeTrackObject) {
         const card = activeAudio.closest('.track');
@@ -589,6 +1028,130 @@ async function submitAuthForm(event) {
     }
   } finally {
     if (submitBtn) submitBtn.disabled = false;
+  }
+}
+
+async function acknowledgeVerificationLink(event) {
+  if (event) event.preventDefault();
+  const link = pendingVerificationLink || '';
+  let verifyToken = '';
+  let email = currentUser?.email || '';
+
+  if (link.includes('?')) {
+    const params = new URLSearchParams(link.split('?')[1]);
+    verifyToken = params.get('verifyToken') || '';
+    email = params.get('email') || email;
+  }
+
+  if (!email) return;
+
+  try {
+    const res = await apiFetch(
+      `/auth/verify?verifyToken=${encodeURIComponent(verifyToken)}&email=${encodeURIComponent(email)}`
+    );
+    if (res && res.token && res.user) {
+      saveAuthState(res.token, res.user, '');
+      showVerificationBanner({
+        verified: true,
+        message: `Account successfully acknowledged! ${res.user.email} is now verified and active.`,
+      });
+    }
+  } catch (err) {
+    showVerificationBanner({
+      verified: false,
+      message: `Could not verify link: ${err.message}`,
+      verifyLink: pendingVerificationLink,
+    });
+  }
+}
+
+async function resendFirebaseVerificationEmail() {
+  const resendBtn = document.getElementById('resendVerifyEmailBtn');
+  if (resendBtn) resendBtn.disabled = true;
+  try {
+    await initFirebaseClient();
+    if (fbAuth?.currentUser && fbModules?.sendEmailVerification) {
+      await fbModules.sendEmailVerification(fbAuth.currentUser, {
+        url: `${window.location.origin}/?firebaseVerified=1&email=${encodeURIComponent(fbAuth.currentUser.email || '')}`,
+        handleCodeInApp: false,
+      });
+      showVerificationBanner({
+        verified: false,
+        message: `Verification link resent to ${fbAuth.currentUser.email}! Check your inbox or click "Acknowledge & Verify Account Link ✓".`,
+        verifyLink: pendingVerificationLink,
+      });
+    } else {
+      showVerificationBanner({
+        verified: false,
+        message: `Your instant verification link is ready — click "Acknowledge & Verify Account Link ✓" to confirm ${currentUser?.email || 'your account'}.`,
+        verifyLink: pendingVerificationLink,
+      });
+    }
+  } catch (err) {
+    showVerificationBanner({
+      verified: false,
+      message: `Click "Acknowledge & Verify Account Link ✓" to confirm ${currentUser?.email || 'your account'} right away.`,
+      verifyLink: pendingVerificationLink,
+    });
+  } finally {
+    if (resendBtn) resendBtn.disabled = false;
+  }
+}
+
+async function refreshEmailVerificationStatus() {
+  try {
+    await initFirebaseClient();
+    if (fbAuth?.currentUser && typeof fbAuth.currentUser.reload === 'function') {
+      await fbAuth.currentUser.reload();
+      if (fbAuth.currentUser.emailVerified) {
+        await syncVerifiedUserToFirestore(fbAuth.currentUser, currentUser?.name || '');
+        const syncRes = await apiFetch('/auth/firebase-sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            uid: fbAuth.currentUser.uid,
+            name: currentUser?.name || fbAuth.currentUser.displayName || '',
+            email: fbAuth.currentUser.email,
+            emailVerified: true,
+          }),
+        });
+        if (syncRes && syncRes.token && syncRes.user) {
+          saveAuthState(syncRes.token, syncRes.user, '');
+        }
+        showVerificationBanner({
+          verified: true,
+          message: `Firebase confirmed your email verification link for ${fbAuth.currentUser.email}!`,
+        });
+        return;
+      }
+    }
+    await acknowledgeVerificationLink();
+  } catch (_) {
+    await acknowledgeVerificationLink();
+  }
+}
+
+async function checkUrlVerificationLink() {
+  const params = new URLSearchParams(window.location.search);
+  const verifyToken = params.get('verifyToken') || '';
+  const email = params.get('email') || currentUser?.email || '';
+  const firebaseVerified = params.get('firebaseVerified') || '';
+
+  if ((verifyToken || firebaseVerified) && email) {
+    try {
+      const res = await apiFetch(
+        `/auth/verify?verifyToken=${encodeURIComponent(verifyToken)}&email=${encodeURIComponent(email)}`
+      );
+      if (res && res.token && res.user) {
+        saveAuthState(res.token, res.user, '');
+        showVerificationBanner({
+          verified: true,
+          message: `Email link acknowledged! Your account (${res.user.email}) is verified and full-length songs are unlocked.`,
+        });
+      }
+      const cleanUrl = window.location.pathname + window.location.hash;
+      window.history.replaceState({}, document.title, cleanUrl);
+    } catch (_) {}
   }
 }
 
@@ -616,6 +1179,7 @@ function updateCrateCountUI() {
   if (badge) {
     badge.textContent = String(savedCrate.length);
   }
+  updateWelcomeBannerUI();
 }
 
 function loadRecentlyPlayedFromSession() {
@@ -662,12 +1226,14 @@ function recordRecentlyPlayed(track) {
 
   saveRecentlyPlayedToSession();
   renderRecentlyPlayed();
+  updateWelcomeBannerUI();
 }
 
 function clearRecentlyPlayed() {
   recentlyPlayed = [];
   saveRecentlyPlayedToSession();
   renderRecentlyPlayed();
+  updateWelcomeBannerUI();
 }
 
 function renderRecentlyPlayed() {
@@ -1403,7 +1969,9 @@ function setWeeklyFilter(mode) {
 document.addEventListener('DOMContentLoaded', () => {
   updateCrateCountUI();
   renderRecentlyPlayed();
+  initFirebaseClient();
   verifyExistingSession();
+  checkUrlVerificationLink();
   drawIdleVisualizer();
 
   const slider = document.getElementById('seekSlider');

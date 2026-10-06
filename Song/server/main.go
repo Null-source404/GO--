@@ -134,15 +134,20 @@ type LyricsResponse struct {
 
 // Authentication & Full-Track Models
 type UserRecord struct {
-	Name         string `json:"name"`
-	Email        string `json:"email"`
-	PasswordHash string `json:"passwordHash"`
-	CreatedAt    string `json:"createdAt"`
+	UID               string `json:"uid,omitempty"`
+	Name              string `json:"name"`
+	Email             string `json:"email"`
+	PasswordHash      string `json:"passwordHash"`
+	EmailVerified     bool   `json:"emailVerified"`
+	VerificationToken string `json:"verificationToken,omitempty"`
+	CreatedAt         string `json:"createdAt"`
 }
 
 type PublicUser struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
+	UID           string `json:"uid,omitempty"`
+	Name          string `json:"name"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"emailVerified"`
 }
 
 type AuthRequest struct {
@@ -151,9 +156,17 @@ type AuthRequest struct {
 	Password string `json:"password"`
 }
 
+type FirebaseSyncRequest struct {
+	UID           string `json:"uid"`
+	Name          string `json:"name"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"emailVerified"`
+}
+
 type AuthResponse struct {
-	Token string     `json:"token"`
-	User  PublicUser `json:"user"`
+	Token            string     `json:"token"`
+	User             PublicUser `json:"user"`
+	VerificationLink string     `json:"verificationLink,omitempty"`
 }
 
 type FullTrackResponse struct {
@@ -294,11 +307,14 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	verifyTok := generateToken()
 	record := UserRecord{
-		Name:         name,
-		Email:        email,
-		PasswordHash: hashPassword(email, password),
-		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+		Name:              name,
+		Email:             email,
+		PasswordHash:      hashPassword(email, password),
+		EmailVerified:     false,
+		VerificationToken: verifyTok,
+		CreatedAt:         time.Now().UTC().Format(time.RFC3339),
 	}
 	usersByEmail[email] = record
 	saveUsersToDiskLocked()
@@ -307,10 +323,17 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	sessions[token] = email
 	authMu.Unlock()
 
+	verifyLink := fmt.Sprintf("/?verifyToken=%s&email=%s", url.QueryEscape(verifyTok), url.QueryEscape(email))
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(AuthResponse{
 		Token: token,
-		User:  PublicUser{Name: record.Name, Email: record.Email},
+		User: PublicUser{
+			Name:          record.Name,
+			Email:         record.Email,
+			EmailVerified: record.EmailVerified,
+		},
+		VerificationLink: verifyLink,
 	})
 }
 
@@ -342,6 +365,136 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if record.VerificationToken == "" {
+		record.VerificationToken = generateToken()
+		usersByEmail[email] = record
+		saveUsersToDiskLocked()
+	}
+
+	token := generateToken()
+	sessions[token] = email
+	authMu.Unlock()
+
+	verifyLink := ""
+	if !record.EmailVerified && record.VerificationToken != "" {
+		verifyLink = fmt.Sprintf("/?verifyToken=%s&email=%s", url.QueryEscape(record.VerificationToken), url.QueryEscape(email))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(AuthResponse{
+		Token: token,
+		User: PublicUser{
+			UID:           record.UID,
+			Name:          record.Name,
+			Email:         record.Email,
+			EmailVerified: record.EmailVerified,
+		},
+		VerificationLink: verifyLink,
+	})
+}
+
+// Syncs a Firebase-authenticated user (Email/Password or Google Auth) with the Go server session
+func firebaseSyncHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req FirebaseSyncRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	name := strings.TrimSpace(req.Name)
+	if email == "" {
+		http.Error(w, "email is required", http.StatusBadRequest)
+		return
+	}
+	if name == "" {
+		parts := strings.Split(email, "@")
+		name = parts[0]
+	}
+
+	authMu.Lock()
+	record, exists := usersByEmail[email]
+	if !exists {
+		record = UserRecord{
+			UID:               strings.TrimSpace(req.UID),
+			Name:              name,
+			Email:             email,
+			EmailVerified:     req.EmailVerified,
+			VerificationToken: generateToken(),
+			CreatedAt:         time.Now().UTC().Format(time.RFC3339),
+		}
+	} else {
+		if req.UID != "" {
+			record.UID = strings.TrimSpace(req.UID)
+		}
+		if name != "" {
+			record.Name = name
+		}
+		if req.EmailVerified {
+			record.EmailVerified = true
+		}
+		if record.VerificationToken == "" {
+			record.VerificationToken = generateToken()
+		}
+	}
+	usersByEmail[email] = record
+	saveUsersToDiskLocked()
+
+	token := generateToken()
+	sessions[token] = email
+	authMu.Unlock()
+
+	verifyLink := ""
+	if !record.EmailVerified && record.VerificationToken != "" {
+		verifyLink = fmt.Sprintf("/?verifyToken=%s&email=%s", url.QueryEscape(record.VerificationToken), url.QueryEscape(email))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(AuthResponse{
+		Token: token,
+		User: PublicUser{
+			UID:           record.UID,
+			Name:          record.Name,
+			Email:         record.Email,
+			EmailVerified: record.EmailVerified,
+		},
+		VerificationLink: verifyLink,
+	})
+}
+
+// Verifies an email acknowledgment link (?verifyToken=...&email=...) to confirm account creation
+func verifyEmailHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	verifyTok := strings.TrimSpace(r.URL.Query().Get("verifyToken"))
+	email := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("email")))
+
+	authMu.Lock()
+	record, exists := usersByEmail[email]
+	if !exists || (verifyTok != "" && record.VerificationToken != "" && record.VerificationToken != verifyTok) {
+		authMu.Unlock()
+		http.Error(w, "Invalid or expired verification link", http.StatusBadRequest)
+		return
+	}
+
+	record.EmailVerified = true
+	usersByEmail[email] = record
+	saveUsersToDiskLocked()
+
 	token := generateToken()
 	sessions[token] = email
 	authMu.Unlock()
@@ -349,7 +502,12 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(AuthResponse{
 		Token: token,
-		User:  PublicUser{Name: record.Name, Email: record.Email},
+		User: PublicUser{
+			UID:           record.UID,
+			Name:          record.Name,
+			Email:         record.Email,
+			EmailVerified: true,
+		},
 	})
 }
 
@@ -386,7 +544,12 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(PublicUser{Name: user.Name, Email: user.Email})
+	json.NewEncoder(w).Encode(PublicUser{
+		UID:           user.UID,
+		Name:          user.Name,
+		Email:         user.Email,
+		EmailVerified: user.EmailVerified,
+	})
 }
 
 func isYouTubeEmbeddable(videoID string) bool {
@@ -1100,6 +1263,8 @@ func main() {
 	mux.HandleFunc("/lyrics", lyricsHandler)
 	mux.HandleFunc("/auth/register", registerHandler)
 	mux.HandleFunc("/auth/login", loginHandler)
+	mux.HandleFunc("/auth/firebase-sync", firebaseSyncHandler)
+	mux.HandleFunc("/auth/verify", verifyEmailHandler)
 	mux.HandleFunc("/auth/logout", logoutHandler)
 	mux.HandleFunc("/auth/me", meHandler)
 	mux.HandleFunc("/fulltrack", fullTrackHandler)

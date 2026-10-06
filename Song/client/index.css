@@ -1359,6 +1359,211 @@ audio.preview-audio {
   margin-bottom: 0.9rem;
 }
 
+.auth-success {
+  padding: 0.65rem 0.85rem;
+  border-radius: 8px;
+  background: rgba(16, 185, 129, 0.14);
+  border: 1px solid rgba(16, 185, 129, 0.38);
+  color: #a7f3d0;
+  font-size: 0.82rem;
+  margin-bottom: 0.9rem;
+  line-height: 1.45;
+}
+
+.google-auth-btn {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  padding: 0.65rem 1rem;
+  font-weight: 600;
+  margin-bottom: 0.8rem;
+  background: rgba(30, 41, 59, 0.92);
+  border-color: rgba(56, 189, 248, 0.35);
+}
+
+.google-auth-btn:hover {
+  border-color: var(--accent-blue);
+  background: rgba(56, 189, 248, 0.12);
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-bottom: 0.85rem;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+.firebase-provider-note {
+  margin-top: 0.95rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+}
+
+.firebase-provider-note summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--accent-blue);
+}
+
+.firebase-provider-note p {
+  margin: 0.45rem 0 0;
+  line-height: 1.45;
+}
+
+.firebase-provider-note a {
+  color: var(--accent-blue);
+  text-decoration: underline;
+}
+
+.verification-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-radius: 10px;
+  background: rgba(14, 165, 233, 0.11);
+  border: 1px solid rgba(56, 189, 248, 0.38);
+  color: var(--text-primary);
+  font-size: 0.83rem;
+}
+
+.verification-banner.verified-state {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.42);
+}
+
+.verification-banner-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  flex: 1;
+  min-width: 240px;
+}
+
+.verification-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.2rem 0.55rem;
+  border-radius: 6px;
+  background: rgba(56, 189, 248, 0.2);
+  color: var(--accent-blue);
+  white-space: nowrap;
+}
+
+.verification-banner.verified-state .verification-badge {
+  background: rgba(16, 185, 129, 0.22);
+  color: var(--accent-emerald);
+}
+
+.verification-banner-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.welcome-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  padding: 0.85rem 1.1rem;
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(17, 24, 39, 0.96), rgba(30, 41, 59, 0.88));
+  border: 1px solid rgba(16, 185, 129, 0.34);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+}
+
+.welcome-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  flex: 1;
+  min-width: 260px;
+}
+
+.welcome-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  background: rgba(16, 185, 129, 0.16);
+  border: 1px solid rgba(16, 185, 129, 0.42);
+  color: var(--accent-emerald);
+  font-family: 'Syne', sans-serif;
+  font-weight: 700;
+  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.welcome-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.welcome-title-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.welcome-title-line h2 {
+  margin: 0;
+  font-family: 'Syne', sans-serif;
+  font-size: 1.04rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.welcome-status-text {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.16rem 0.5rem;
+  border-radius: 5px;
+  background: rgba(16, 185, 129, 0.16);
+  color: var(--accent-emerald);
+}
+
+.welcome-sub {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.welcome-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
 .auth-submit-btn {
   width: 100%;
   margin-top: 0.25rem;
