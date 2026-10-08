@@ -4,20 +4,53 @@ import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import rateLimit from 'express-rate-limit';
+import NodeCache from 'node-cache';
+import helmet from 'helmet';
+import cookieParser from 'cookie-parser';
+import csrf from 'csurf';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
+app.use(helmet());
 app.use(express.json());
+app.use(cookieParser());
+app.use((req, res, next) => {
+  // Enforce HTTPS in production
+  if (process.env.NODE_ENV === 'production' && req.protocol !== 'https') {
+    return res.status(403).send('HTTPS required');
+  }
+  res.setHeader('Access-Control-Allow-Origin', process.env.ALLOWED_ORIGINS || '*');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
 
 const USERS_FILE = path.join(__dirname, 'Song', 'server', 'users.json');
 const usersByEmail = new Map();
-const sessions = new Map();
-const streamCache = new Map();
-const ytCache = new Map();
+
+// Secure caches with TTL
+const ytCache = new NodeCache({ stdTTL: 3600 }); // 1 hour
+const streamCache = new NodeCache({ stdTTL: 1800 }); // 30 min
+
+// Rate limiting
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 requests per IP
+  message: 'Too many auth attempts, please try again later',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const csrfProtection = csrf({ cookie: true });
 
 function loadUsersFromDisk() {
   try {
@@ -37,23 +70,51 @@ function loadUsersFromDisk() {
 function saveUsersToDisk() {
   try {
     const list = Array.from(usersByEmail.values());
-    fs.writeFileSync(USERS_FILE, JSON.stringify(list, null, 2), 'utf-8');
-  } catch (_) {
-    // Ignore write errors
+    // Write with restricted permissions (0600 = owner only)
+    fs.writeFileSync(USERS_FILE, JSON.stringify(list, null, 2), { mode: 0o600, encoding: 'utf-8' });
+  } catch (err) {
+    console.error('Failed to save users:', err);
+  }
+}
+
+function verifyFilePermissions() {
+  if (fs.existsSync(USERS_FILE)) {
+    try {
+      const stats = fs.statSync(USERS_FILE);
+      if ((stats.mode & 0o077) !== 0) {
+        console.warn('⚠️  users.json has insecure permissions; fixing...');
+        fs.chmodSync(USERS_FILE, 0o600);
+      }
+    } catch (_) {}
   }
 }
 
 loadUsersFromDisk();
+verifyFilePermissions();
 
-function hashPassword(email, password) {
-  return crypto
-    .createHash('sha256')
-    .update(`${email.trim().toLowerCase()}:soniccrate:${password}`)
-    .digest('hex');
+async function hashPassword(password) {
+  const saltRounds = 12;
+  return await bcrypt.hash(password, saltRounds);
 }
 
-function generateToken() {
-  return crypto.randomBytes(24).toString('hex');
+async function verifyPassword(plaintext, hash) {
+  return await bcrypt.compare(plaintext, hash);
+}
+
+function generateSessionToken(email) {
+  return jwt.sign(
+    { email, iat: Math.floor(Date.now() / 1000) },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+}
+
+function verifySessionToken(token) {
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (_) {
+    return null;
+  }
 }
 
 function authenticateRequest(req) {
@@ -63,9 +124,11 @@ function authenticateRequest(req) {
     token = String(req.query.token).trim();
   }
   if (!token) return null;
-  const email = sessions.get(token);
-  if (!email) return null;
-  return usersByEmail.get(email) || null;
+  
+  const decoded = verifySessionToken(token);
+  if (!decoded) return null;
+  
+  return usersByEmail.get(decoded.email) || null;
 }
 
 function normalizeTrack(item, recReason = '') {
@@ -165,86 +228,93 @@ async function fetchWeeklyHitsHelper(limit = 12) {
   }
 }
 
-app.post('/auth/register', (req, res) => {
+app.post('/auth/register', authLimiter, csrfProtection, async (req, res) => {
   const name = String(req.body?.name || '').trim();
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
 
-  if (!name || !email || password.length < 4) {
-    return res.status(400).send('Name, valid email, and password (min 4 chars) are required');
+  if (!name || !email || password.length < 6) {
+    return res.status(400).send('Name, valid email, and password (min 6 chars) are required');
   }
 
   if (usersByEmail.has(email)) {
     return res.status(409).send('An account with that email already exists. Please sign in.');
   }
 
-  const verificationToken = generateToken();
-  const record = {
-    name,
-    email,
-    passwordHash: hashPassword(email, password),
-    emailVerified: false,
-    verificationToken,
-    createdAt: new Date().toISOString(),
-  };
-  usersByEmail.set(email, record);
-  saveUsersToDisk();
-
-  const token = generateToken();
-  sessions.set(token, email);
-
-  const verificationLink = `/?verifyToken=${encodeURIComponent(verificationToken)}&email=${encodeURIComponent(email)}`;
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  return res.json({
-    token,
-    user: {
-      name: record.name,
-      email: record.email,
-      emailVerified: record.emailVerified,
-    },
-    verificationLink,
-  });
-});
-
-app.post('/auth/login', (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  const password = String(req.body?.password || '');
-  const expectedHash = hashPassword(email, password);
-
-  const record = usersByEmail.get(email);
-  if (!record || record.passwordHash !== expectedHash) {
-    return res.status(401).send('Invalid email or password');
-  }
-
-  if (!record.verificationToken) {
-    record.verificationToken = generateToken();
+  try {
+    const passwordHash = await hashPassword(password);
+    const record = {
+      name,
+      email,
+      passwordHash,
+      emailVerified: false,
+      verificationToken: crypto.randomBytes(32).toString('hex'),
+      createdAt: new Date().toISOString(),
+    };
     usersByEmail.set(email, record);
     saveUsersToDisk();
+
+    const token = generateSessionToken(email);
+    const verificationLink = `/?verifyToken=${encodeURIComponent(record.verificationToken)}&email=${encodeURIComponent(email)}&_internal=verify`;
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.json({
+      token,
+      user: {
+        name: record.name,
+        email: record.email,
+        emailVerified: record.emailVerified,
+      },
+      verificationLink,
+    });
+  } catch (err) {
+    console.error('Register error:', err);
+    return res.status(500).send('Registration failed');
   }
-
-  const token = generateToken();
-  sessions.set(token, email);
-
-  const verificationLink =
-    !record.emailVerified && record.verificationToken
-      ? `/?verifyToken=${encodeURIComponent(record.verificationToken)}&email=${encodeURIComponent(email)}`
-      : '';
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  return res.json({
-    token,
-    user: {
-      uid: record.uid || '',
-      name: record.name,
-      email: record.email,
-      emailVerified: Boolean(record.emailVerified),
-    },
-    verificationLink,
-  });
 });
 
-app.post('/auth/firebase-sync', (req, res) => {
+app.post('/auth/login', authLimiter, csrfProtection, async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+
+  try {
+    const record = usersByEmail.get(email);
+    const passwordMatches = record ? await verifyPassword(password, record.passwordHash) : false;
+
+    if (!record || !passwordMatches) {
+      return res.status(401).send('Invalid email or password');
+    }
+
+    if (!record.verificationToken) {
+      record.verificationToken = crypto.randomBytes(32).toString('hex');
+      usersByEmail.set(email, record);
+      saveUsersToDisk();
+    }
+
+    const token = generateSessionToken(email);
+    const verificationLink =
+      !record.emailVerified && record.verificationToken
+        ? `/?verifyToken=${encodeURIComponent(record.verificationToken)}&email=${encodeURIComponent(email)}&_internal=verify`
+        : '';
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.json({
+      token,
+      user: {
+        uid: record.uid || '',
+        name: record.name,
+        email: record.email,
+        emailVerified: Boolean(record.emailVerified),
+      },
+      verificationLink,
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    return res.status(500).send('Login failed');
+  }
+});
+
+app.post('/auth/firebase-sync', authLimiter, csrfProtection, async (req, res) => {
   const uid = String(req.body?.uid || '').trim();
   const email = String(req.body?.email || '').trim().toLowerCase();
   let name = String(req.body?.name || '').trim();
@@ -257,56 +327,77 @@ app.post('/auth/firebase-sync', (req, res) => {
     name = email.split('@')[0];
   }
 
-  let record = usersByEmail.get(email);
-  if (!record) {
-    record = {
-      uid,
-      name,
-      email,
-      passwordHash: '',
-      emailVerified,
-      verificationToken: generateToken(),
-      createdAt: new Date().toISOString(),
-    };
-  } else {
-    if (uid) record.uid = uid;
-    if (name) record.name = name;
-    if (emailVerified) record.emailVerified = true;
-    if (!record.verificationToken) record.verificationToken = generateToken();
+  try {
+    let record = usersByEmail.get(email);
+    if (!record) {
+      record = {
+        uid,
+        name,
+        email,
+        passwordHash: '', // Firebase auth, no local password
+        emailVerified,
+        verificationToken: crypto.randomBytes(32).toString('hex'),
+        createdAt: new Date().toISOString(),
+      };
+    } else {
+      if (uid) record.uid = uid;
+      if (name) record.name = name;
+      if (emailVerified) record.emailVerified = true;
+      if (!record.verificationToken) record.verificationToken = crypto.randomBytes(32).toString('hex');
+    }
+    usersByEmail.set(email, record);
+    saveUsersToDisk();
+
+    const token = generateSessionToken(email);
+    const verificationLink =
+      !record.emailVerified && record.verificationToken
+        ? `/?verifyToken=${encodeURIComponent(record.verificationToken)}&email=${encodeURIComponent(email)}&_internal=verify`
+        : '';
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.json({
+      token,
+      user: {
+        uid: record.uid || '',
+        name: record.name,
+        email: record.email,
+        emailVerified: Boolean(record.emailVerified),
+      },
+      verificationLink,
+    });
+  } catch (err) {
+    console.error('Firebase sync error:', err);
+    return res.status(500).send('Firebase sync failed');
   }
-  usersByEmail.set(email, record);
-  saveUsersToDisk();
-
-  const token = generateToken();
-  sessions.set(token, email);
-
-  const verificationLink =
-    !record.emailVerified && record.verificationToken
-      ? `/?verifyToken=${encodeURIComponent(record.verificationToken)}&email=${encodeURIComponent(email)}`
-      : '';
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  return res.json({
-    token,
-    user: {
-      uid: record.uid || '',
-      name: record.name,
-      email: record.email,
-      emailVerified: Boolean(record.emailVerified),
-    },
-    verificationLink,
-  });
 });
 
-app.get('/auth/verify', (req, res) => {
+app.get('/auth/verify', authLimiter, (req, res) => {
   const verifyTok = String(req.query.verifyToken || '').trim();
   const email = String(req.query.email || '').trim().toLowerCase();
+  const isInternal = req.query._internal === 'verify';
+
+  if (!isInternal) {
+    return res.status(400).send('Invalid verification link');
+  }
 
   const record = usersByEmail.get(email);
-  if (
-    !record ||
-    (verifyTok && record.verificationToken && record.verificationToken !== verifyTok)
-  ) {
+  if (!record) {
+    return res.status(400).send('Invalid or expired verification link');
+  }
+
+  let tokenValid = false;
+  if (verifyTok && record.verificationToken) {
+    try {
+      tokenValid = crypto.timingSafeEqual(
+        Buffer.from(verifyTok),
+        Buffer.from(record.verificationToken)
+      );
+    } catch (_) {
+      tokenValid = false;
+    }
+  }
+
+  if (!tokenValid) {
     return res.status(400).send('Invalid or expired verification link');
   }
 
@@ -314,8 +405,7 @@ app.get('/auth/verify', (req, res) => {
   usersByEmail.set(email, record);
   saveUsersToDisk();
 
-  const token = generateToken();
-  sessions.set(token, email);
+  const token = generateSessionToken(email);
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   return res.json({
@@ -329,10 +419,8 @@ app.get('/auth/verify', (req, res) => {
   });
 });
 
-app.post('/auth/logout', (req, res) => {
-  const authHeader = String(req.headers.authorization || '').trim();
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-  if (token) sessions.delete(token);
+app.post('/auth/logout', csrfProtection, (req, res) => {
+  // JWT is stateless; logout is client-side (discard token)
   res.setHeader('Access-Control-Allow-Origin', '*');
   return res.json({ ok: true });
 });
@@ -393,6 +481,16 @@ async function lookupYouTubeVideoID(trackName, artistName) {
   }
 }
 
+function isValidAudioUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const allowed = ['itunes.apple.com', 'audius.co', 'youtube.com', 'youtu.be'];
+    return allowed.some(domain => parsed.hostname.includes(domain));
+  } catch (_) {
+    return false;
+  }
+}
+
 async function resolveDirectFullSongURL(trackName, artistName) {
   const cacheKey = `${trackName.trim()}::${artistName.trim()}`.toLowerCase();
   if (streamCache.has(cacheKey)) {
@@ -411,8 +509,10 @@ async function resolveDirectFullSongURL(trackName, artistName) {
       const first = j2.data?.[0];
       if (first && first.id) {
         const audiusStream = `https://api.audius.co/v1/tracks/${encodeURIComponent(first.id)}/stream?app_name=soniccrate`;
-        streamCache.set(cacheKey, audiusStream);
-        return audiusStream;
+        if (isValidAudioUrl(audiusStream)) {
+          streamCache.set(cacheKey, audiusStream);
+          return audiusStream;
+        }
       }
     }
   } catch (_) {}
@@ -425,6 +525,11 @@ app.get('/stream', async (req, res) => {
   const track = String(req.query.track || '').trim();
   const artist = String(req.query.artist || '').trim();
   const previewUrl = String(req.query.preview || '').trim();
+
+  // Validate previewUrl against whitelist
+  if (previewUrl && !isValidAudioUrl(previewUrl)) {
+    return res.status(400).send('Invalid audio URL');
+  }
 
   const user = authenticateRequest(req);
   let targetUrl = '';
@@ -753,4 +858,8 @@ app.get('*', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running at http://0.0.0.0:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  if (process.env.NODE_ENV === 'production') {
+    console.log('⚠️  Production mode: HTTPS required, CSRF protection enabled, rate limiting active');
+  }
 });
