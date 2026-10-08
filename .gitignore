@@ -5,3 +5,15 @@ Song/itunes-search
 itunes-search
 *.exe
 .DS_Store
+
+# Firebase client config - NEVER commit credentials
+firebase-applet-config.json
+Song/client/firebase-applet-config.json
+*.firebase.json
+
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+secrets.json
+
