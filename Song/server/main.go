@@ -552,6 +552,67 @@ func meHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func firebaseConfigHandler(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+
+	apiKey := strings.TrimSpace(os.Getenv("FIREBASE_API_KEY"))
+	projectID := strings.TrimSpace(os.Getenv("FIREBASE_PROJECT_ID"))
+	if apiKey != "" && projectID != "" && !strings.Contains(apiKey, "your_firebase_api_key") {
+		authDomain := strings.TrimSpace(os.Getenv("FIREBASE_AUTH_DOMAIN"))
+		if authDomain == "" {
+			authDomain = projectID + ".firebaseapp.com"
+		}
+		storageBucket := strings.TrimSpace(os.Getenv("FIREBASE_STORAGE_BUCKET"))
+		if storageBucket == "" {
+			storageBucket = projectID + ".firebasestorage.app"
+		}
+		dbID := strings.TrimSpace(os.Getenv("FIREBASE_FIRESTORE_DATABASE_ID"))
+		if dbID == "" {
+			dbID = "(default)"
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"configured":          true,
+			"apiKey":              apiKey,
+			"authDomain":          authDomain,
+			"projectId":           projectID,
+			"storageBucket":       storageBucket,
+			"messagingSenderId":   strings.TrimSpace(os.Getenv("FIREBASE_MESSAGING_SENDER_ID")),
+			"appId":               strings.TrimSpace(os.Getenv("FIREBASE_APP_ID")),
+			"firestoreDatabaseId": dbID,
+		})
+		return
+	}
+
+	candidates := []string{
+		"firebase-applet-config.json",
+		filepath.Join("..", "firebase-applet-config.json"),
+		filepath.Join("..", "..", "firebase-applet-config.json"),
+	}
+	for _, p := range candidates {
+		raw, err := os.ReadFile(p)
+		if err == nil {
+			var parsed map[string]interface{}
+			if json.Unmarshal(raw, &parsed) == nil {
+				if key, ok := parsed["apiKey"].(string); ok && key != "" && !strings.Contains(key, "your_firebase_api_key") {
+					parsed["configured"] = true
+					json.NewEncoder(w).Encode(parsed)
+					return
+				}
+			}
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"configured": false,
+	})
+}
+
 func isYouTubeEmbeddable(videoID string) bool {
 	oembedURL := fmt.Sprintf("https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=%s&format=json", url.QueryEscape(videoID))
 	resp, err := httpClient.Get(oembedURL)
@@ -1267,6 +1328,8 @@ func main() {
 	mux.HandleFunc("/auth/verify", verifyEmailHandler)
 	mux.HandleFunc("/auth/logout", logoutHandler)
 	mux.HandleFunc("/auth/me", meHandler)
+	mux.HandleFunc("/api/firebase-config", firebaseConfigHandler)
+	mux.HandleFunc("/firebase-applet-config.json", firebaseConfigHandler)
 	mux.HandleFunc("/fulltrack", fullTrackHandler)
 	mux.HandleFunc("/stream", streamHandler)
 	mux.Handle("/", http.FileServer(http.Dir(clientDir)))

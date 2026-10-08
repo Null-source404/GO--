@@ -73,10 +73,14 @@ async function initFirebaseClient() {
   if (fbInitPromise) return fbInitPromise;
   fbInitPromise = (async () => {
     try {
-      const cfgResp = await fetch('/firebase-applet-config.json');
+      const cfgResp = await fetch('/api/firebase-config');
       if (!cfgResp.ok) return null;
       const firebaseConfig = await cfgResp.json();
-      if (!firebaseConfig || !firebaseConfig.apiKey) return null;
+      if (!firebaseConfig || firebaseConfig.configured === false || !firebaseConfig.apiKey) {
+        const googleBtn = document.getElementById('googleAuthBtn');
+        if (googleBtn) googleBtn.classList.add('hidden');
+        return null;
+      }
 
       const [appMod, authMod, firestoreMod] = await Promise.all([
         import('https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js'),

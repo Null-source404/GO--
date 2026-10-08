@@ -712,13 +712,39 @@ app.get('/lyrics', async (req, res) => {
 });
 
 const clientDir = path.join(__dirname, 'Song', 'client');
-app.get('/firebase-applet-config.json', (req, res) => {
+
+function resolveFirebaseRuntimeConfig() {
+  if (process.env.FIREBASE_API_KEY && process.env.FIREBASE_PROJECT_ID) {
+    return {
+      configured: true,
+      apiKey: process.env.FIREBASE_API_KEY,
+      authDomain: process.env.FIREBASE_AUTH_DOMAIN || `${process.env.FIREBASE_PROJECT_ID}.firebaseapp.com`,
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || `${process.env.FIREBASE_PROJECT_ID}.firebasestorage.app`,
+      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
+      appId: process.env.FIREBASE_APP_ID || '',
+      firestoreDatabaseId: process.env.FIREBASE_FIRESTORE_DATABASE_ID || '(default)',
+    };
+  }
+
   const rootConfig = path.join(__dirname, 'firebase-applet-config.json');
   if (fs.existsSync(rootConfig)) {
-    return res.sendFile(rootConfig);
+    try {
+      const parsed = JSON.parse(fs.readFileSync(rootConfig, 'utf8'));
+      if (parsed && parsed.apiKey && !String(parsed.apiKey).includes('your_firebase_api_key')) {
+        return { configured: true, ...parsed };
+      }
+    } catch (_) {}
   }
-  return res.sendFile(path.join(clientDir, 'firebase-applet-config.json'));
+
+  return { configured: false };
+}
+
+app.get(['/api/firebase-config', '/firebase-applet-config.json'], (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json(resolveFirebaseRuntimeConfig());
 });
+
 app.use(express.static(clientDir));
 
 app.get('*', (req, res) => {

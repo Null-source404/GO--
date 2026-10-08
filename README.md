@@ -52,10 +52,17 @@ GO--/
 │   │                                # and concurrent Full-Track resolver (/fulltrack)
 │   ├── go.mod                       # Go module definition (zero external dependencies)
 │   └── screenshot-2026-08-04.png    # Application interface preview
+├── .env.example                     # Safe environment variable template (no real keys committed)
+├── .gitignore                       # Excludes firebase-applet-config.json, .env*, keys, and users.json
 ├── firebase-blueprint.json          # Firestore schema blueprint (UserProfile & isolated UserPrivateInfo)
 ├── firestore.rules                  # Hardened Zero-Trust Firestore security rules
 └── README.md
 ```
+
+### Credential & Public Repository Security
+
+- **Zero Exposed Secrets in Version Control:** All Firebase configuration files (`firebase-applet-config.json`, `**/firebase-applet-config.json`, `firebase_applet_config.xml`), `.env` files, service account keys, and local user session stores (`users.json`) are excluded via `.gitignore` and never stored in `Song/client/` or hardcoded in client HTML/JS files.
+- **Environment Variable Support (`.env.example`):** Copy `.env.example` to `.env` (or export `FIREBASE_API_KEY`, `FIREBASE_PROJECT_ID`, `FIREBASE_AUTH_DOMAIN`, `FIREBASE_APP_ID`, `FIREBASE_FIRESTORE_DATABASE_ID`) to inject Firebase credentials at runtime via `/api/firebase-config`. If no Firebase credentials are provided in a public clone, the app automatically falls back to the Go server's built-in `/auth/register`, `/auth/login`, and `/auth/verify` flows without crashing.
 
 ### Server Endpoints (`Song/server/main.go`)
 
@@ -70,6 +77,7 @@ GO--/
 | `/auth/firebase-sync` | `POST` | Public | Syncs a Firebase-authenticated user (`uid`, `name`, `email`, `emailVerified`) with the Go server session and returns a verification acknowledgment link if unverified. |
 | `/auth/verify` | `GET` | Public | Verifies an email acknowledgment link (`?verifyToken=<t>&email=<e>`) to confirm account creation. |
 | `/auth/me` & `/auth/logout` | `GET`/`POST` | Bearer | Validates or terminates the active user session. |
+| `/api/firebase-config` | `GET` | Public | Serves runtime Firebase initialization config from environment variables (or local gitignored config) without committing credentials to version control. |
 | `/fulltrack?track=<t>&artist=<a>` | `GET` | Bearer | Protected endpoint that concurrently verifies and caches embeddable full-length YouTube track IDs. |
 | `/stream?track=<t>&artist=<a>` | `GET` | Bearer/Public | Same-origin audio stream proxy with range request support (`Accept-Ranges: bytes`) and fast `1.2s` upstream timeout. |
 
